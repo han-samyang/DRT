@@ -18,7 +18,11 @@ class EIStoDRT:
     the distribution of relaxation times from frequency-domain impedance data.
     """
     
-    def __init__(self, frequencies, impedances):
+    # Constants
+    DEFAULT_N_TAU = 100  # Default number of tau (relaxation time) points
+    CURVATURE_EPSILON = 1e-10  # Small value to prevent division by zero in curvature calculation
+    
+    def __init__(self, frequencies, impedances, n_tau=None):
         """
         Initialize the EIS to DRT converter.
         
@@ -28,6 +32,8 @@ class EIStoDRT:
             Frequencies in Hz where impedance was measured
         impedances : array-like (complex)
             Complex impedance values (Z = Z' + jZ'')
+        n_tau : int, optional
+            Number of relaxation time points for DRT discretization (default: 100)
         """
         self.frequencies = np.array(frequencies)
         self.impedances = np.array(impedances, dtype=complex)
@@ -36,7 +42,8 @@ class EIStoDRT:
         # Initialize tau grid (relaxation times)
         tau_min = 1 / (2 * np.pi * np.max(self.frequencies))
         tau_max = 1 / (2 * np.pi * np.min(self.frequencies))
-        self.tau = np.logspace(np.log10(tau_min), np.log10(tau_max), 100)
+        n_tau_points = n_tau if n_tau is not None else self.DEFAULT_N_TAU
+        self.tau = np.logspace(np.log10(tau_min), np.log10(tau_max), n_tau_points)
         
         self.gamma = None  # DRT distribution
         self.R_inf = None  # High-frequency resistance
@@ -162,7 +169,7 @@ class EIStoDRT:
         
         return self.tau, self.gamma
     
-    def find_optimal_lambda(self, lambda_range=(1e-6, 1e-1), method='L-curve'):
+    def find_optimal_lambda(self, lambda_range=(1e-6, 1e-1), method='L-curve', n_samples=20):
         """
         Find optimal regularization parameter using L-curve method or cross-validation.
         
@@ -172,6 +179,8 @@ class EIStoDRT:
             Range of lambda values to search
         method : str
             Method to use ('L-curve' or 'gcv' for generalized cross-validation)
+        n_samples : int
+            Number of lambda values to test (default: 20)
         
         Returns:
         --------
@@ -179,15 +188,15 @@ class EIStoDRT:
             Optimal regularization parameter
         """
         if method == 'L-curve':
-            return self._find_lambda_lcurve(lambda_range)
+            return self._find_lambda_lcurve(lambda_range, n_samples)
         elif method == 'gcv':
             return self._find_lambda_gcv(lambda_range)
         else:
             raise ValueError("method must be 'L-curve' or 'gcv'")
     
-    def _find_lambda_lcurve(self, lambda_range):
+    def _find_lambda_lcurve(self, lambda_range, n_samples):
         """Find optimal lambda using L-curve criterion."""
-        lambdas = np.logspace(np.log10(lambda_range[0]), np.log10(lambda_range[1]), 20)
+        lambdas = np.logspace(np.log10(lambda_range[0]), np.log10(lambda_range[1]), n_samples)
         
         residuals = []
         smoothness = []
@@ -227,7 +236,7 @@ class EIStoDRT:
             dy2 = log_smooth[i+1] - log_smooth[i]
             
             # Approximate curvature
-            curv = abs(dx1*dy2 - dx2*dy1) / ((dx1**2 + dy1**2)**1.5 + 1e-10)
+            curv = abs(dx1*dy2 - dx2*dy1) / ((dx1**2 + dy1**2)**1.5 + self.CURVATURE_EPSILON)
             curvatures.append(curv)
         
         # Find lambda with maximum curvature
@@ -249,9 +258,14 @@ class EIStoDRT:
             
             residual = np.linalg.norm(A @ gamma - b)
             n = len(b)
+            p = len(gamma)
             
-            # GCV score
-            score = residual**2 / (n * (1 - n/len(gamma))**2)
+            # GCV score with protection against division by zero
+            if n >= p:
+                # When n >= p, use large penalty
+                score = residual**2 * 1e10
+            else:
+                score = residual**2 / (n * (1 - n/p)**2)
             return score
         
         result = minimize_scalar(gcv_score, 
@@ -332,7 +346,7 @@ class EIStoDRT:
         return fig
 
 
-def generate_synthetic_eis_data(n_points=50):
+def generate_synthetic_eis_data(n_points=50, noise_level=0.5):
     """
     Generate synthetic EIS data for testing.
     
@@ -341,7 +355,9 @@ def generate_synthetic_eis_data(n_points=50):
     Parameters:
     -----------
     n_points : int
-        Number of frequency points
+        Number of frequency points (default: 50)
+    noise_level : float
+        Standard deviation of additive Gaussian noise (default: 0.5)
     
     Returns:
     --------
@@ -366,8 +382,7 @@ def generate_synthetic_eis_data(n_points=50):
     for R, tau in zip(R_values, tau_values):
         impedances += R / (1 + 1j * omega * tau)
     
-    # Add small noise
-    noise_level = 0.5
+    # Add noise
     impedances += (np.random.randn(len(frequencies)) + 
                    1j * np.random.randn(len(frequencies))) * noise_level
     

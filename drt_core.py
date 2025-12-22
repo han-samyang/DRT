@@ -1,359 +1,334 @@
 """
-DRT Core Module - 핵심 수학 계산 엔진
-Based on pyDRTtools methodology (Ciucci's Lab)
+DRT (Distribution of Relaxation Times) Analysis Core Module
+===========================================================
+Implements Tikhonov regularization-based DRT transformation
+from Electrochemical Impedance Spectroscopy (EIS) data.
 
-Version: 0.1 (MVP Prototype)
+Theory References:
+- Ciucci, F., & Orazov, M. (2014). J. Electrochem. Soc., 160(10), F1422.
+- Malifarge, B., et al. (2019). ChemElectroChem, 6(24), 6027–6037.
+
+License: MIT
 """
 
 import numpy as np
-from scipy.optimize import nnls, minimize
+from scipy.linalg import solve
+from scipy.optimize import fminbound
 from scipy.signal import find_peaks
-from scipy.integrate import trapz
-from sklearn.linear_model import Ridge, Lasso
-import pandas as pd
+import warnings
+
+warnings.filterwarnings('ignore')
 
 
-class DRTCalculator:
-    """DRT 계산 클래스 - Streamlit 통합 용이"""
+class DRTAnalyzer:
+    """Core DRT analyzer using Tikhonov regularization."""
     
-    def __init__(self, freq, z_real, z_imag):
-        """
-        Parameters
-        ----------
-        freq : array-like
-            주파수 (Hz)
-        z_real : array-like
-            Z' 실수부 (Ω)
-        z_imag : array-like
-            Z'' 허수부 (Ω, positive)
-        """
-        self.freq = np.asarray(freq, dtype=float)
-        self.z_real = np.asarray(z_real, dtype=float)
-        self.z_imag = np.asarray(z_imag, dtype=float)
+    def __init__(self):
+        self.frequency = None
+        self.Z_real = None
+        self.Z_imag = None
+        self.omega = None
+        self.tau_grid = None
+        self.gamma = None
+        self.Z_reconst_real = None
+        self.Z_reconst_imag = None
+        self.residual = None
+        self.peaks_info = None
+        self.lambda_opt = None
+        self.fit_metrics = {}
         
-        # 데이터 정렬 (주파수 내림차순)
-        sort_idx = np.argsort(-self.freq)
-        self.freq = self.freq[sort_idx]
-        self.z_real = self.z_real[sort_idx]
-        self.z_imag = self.z_imag[sort_idx]
+    def load_data(self, frequency, Z_real, Z_imag):
+        """Load and preprocess EIS data."""
+        frequency = np.asarray(frequency, dtype=float)
+        Z_real = np.asarray(Z_real, dtype=float)
+        Z_imag = np.asarray(Z_imag, dtype=float)
         
-        self.omega = 2 * np.pi * self.freq
+        sort_idx = np.argsort(frequency)
+        self.frequency = frequency[sort_idx]
+        self.Z_real = Z_real[sort_idx]
+        self.Z_imag = np.abs(Z_imag[sort_idx])
         
-        # 결과 저장
-        self.result = None
-    
-    def compute(self, n_tau=150, lambda_param=1e-3, reg_order=2, method='ridge'):
-        """
-        DRT 계산 실행
+        unique_f, unique_idx = np.unique(self.frequency, return_index=True)
+        self.frequency = unique_f
+        self.Z_real = self.Z_real[unique_idx]
+        self.Z_imag = self.Z_imag[unique_idx]
         
-        Parameters
-        ----------
-        n_tau : int
-            τ 그리드 포인트 수
-        lambda_param : float
-            규제화 강도 λ
-        reg_order : int
-            규제화 차수 (0=Ridge, 1=1차미분, 2=2차미분)
-        method : str
-            'ridge', 'ridge_nnls', 'lasso', 'nnls'
+        self.omega = 2 * np.pi * self.frequency
+        self.fit_metrics['n_points'] = len(self.frequency)
         
-        Returns
-        -------
-        dict : 결과 딕셔너리
-        """
+    def _setup_tau_grid(self, n_tau=100):
+        """Setup logarithmic time constant grid."""
+        if self.frequency is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
         
-        # 1. τ 그리드 설정
-        tau = self._setup_tau_grid(n_tau)
+        tau_min = 1 / (2 * np.pi * self.frequency.max())
+        tau_max = 1 / (2 * np.pi * self.frequency.min())
         
-        # 2. 커널 행렬 A 구성
-        A = self._build_kernel_matrix(tau)
+        extension = 0.5
+        tau_min_ext = tau_min / (10 ** extension)
+        tau_max_ext = tau_max * (10 ** extension)
         
-        # 3. 규제화 행렬 L
-        L = self._compute_L_matrix(tau, order=reg_order)
+        self.tau_grid = np.logspace(
+            np.log10(tau_min_ext), 
+            np.log10(tau_max_ext), 
+            n_tau
+        )
         
-        # 4. γ 계산
-        gamma = self._solve_tikhonov(A, self.z_imag, L, lambda_param, method)
-        
-        # 5. 재구성 & 오차
-        z_imag_recon = A @ gamma
-        residual = self.z_imag - z_imag_recon
-        rmse = np.sqrt(np.mean(residual**2))
-        rel_error = rmse / np.mean(np.abs(self.z_imag))
-        
-        # 6. 통계 & 피크
-        stats = self._compute_statistics(tau, gamma)
-        peaks_info = self._find_peaks(tau, gamma)
-        peaks_df = self._peaks_to_dataframe(peaks_info)
-        
-        # 결과 저장
-        self.result = {
-            'tau': tau,
-            'gamma': gamma,
-            'freq': self.freq,
-            'omega': self.omega,
-            'z_real': self.z_real,
-            'z_imag': self.z_imag,
-            'z_imag_recon': z_imag_recon,
-            'residual': residual,
-            'rmse': rmse,
-            'rel_error': rel_error,
-            'stats': stats,
-            'peaks_info': peaks_info,
-            'peaks_df': peaks_df,
-            'A_matrix': A,
-            'L_matrix': L,
-            'lambda_param': lambda_param,
-            'reg_order': reg_order,
-            'method': method,
-            'n_tau': n_tau
-        }
-        
-        return self.result
-    
-    def _setup_tau_grid(self, n_tau):
-        """τ 시간상수 그리드 설정 (log space)"""
-        f_min, f_max = np.min(self.freq), np.max(self.freq)
-        tau_min = 1 / (2 * np.pi * f_max)
-        tau_max = 1 / (2 * np.pi * f_min)
-        
-        tau = np.logspace(np.log10(tau_min), np.log10(tau_max), n_tau)
-        return tau
-    
-    def _build_kernel_matrix(self, tau):
-        """
-        커널 행렬 A 구성
-        A[i,j] = (ω_i * τ_j) / (1 + (ω_i * τ_j)²)
-        """
+    def _build_kernel_matrix(self):
+        """Build kernel matrix K(ω, τ) for DRT inversion."""
         n_freq = len(self.omega)
-        n_tau = len(tau)
-        A = np.zeros((n_freq, n_tau))
+        n_tau = len(self.tau_grid)
         
-        for i in range(n_freq):
-            w_tau = self.omega[i] * tau
-            A[i, :] = w_tau / (1 + w_tau**2)
+        A = np.zeros((2 * n_freq, n_tau))
+        
+        for j, tau in enumerate(self.tau_grid):
+            w_tau = self.omega * tau
+            denom = 1.0 + w_tau**2
+            
+            A[:n_freq, j] = tau / denom
+            A[n_freq:, j] = self.omega * tau**2 / denom
         
         return A
     
-    def _compute_L_matrix(self, tau, order=2):
-        """
-        규제화 행렬 L 구성
-        order=0: Ridge (identity)
-        order=1: 1차 평탄도
-        order=2: 2차 곡률
-        """
-        n_tau = len(tau)
-        d_tau = np.mean(np.diff(tau))
-        
-        if order == 0:
-            L = np.eye(n_tau)
-        elif order == 1:
-            # 1차 미분
-            L = np.diff(np.eye(n_tau), axis=0) / d_tau
+    def _build_data_vector(self):
+        """Build combined data vector [Z_real; Z_imag]."""
+        return np.concatenate([self.Z_real, self.Z_imag])
+    
+    def _regularization_matrix(self, n_tau, order=2):
+        """Build Tikhonov regularization matrix."""
+        if order == 1:
+            L = np.diff(np.eye(n_tau), axis=0)
         elif order == 2:
-            # 2차 미분 (곡률)
-            D1 = np.diff(np.eye(n_tau), axis=0) / d_tau
-            L = np.diff(D1, axis=0) / d_tau
+            I = np.eye(n_tau)
+            L = np.diff(I, n=2, axis=0)
         else:
-            L = np.eye(n_tau)
-        
+            raise ValueError("Only order 1 or 2 supported")
         return L
     
-    def _solve_tikhonov(self, A, b, L, lambda_param, method='ridge'):
-        """
-        Tikhonov 규제화 해결
-        min_γ ||A·γ - b||² + λ·||L·γ||²
-        """
-        
-        if method == 'ridge':
-            # Ridge 회귀 (음수 허용)
-            model = Ridge(alpha=lambda_param, fit_intercept=False, solver='auto')
-            gamma = model.fit(A, b).coef_
-        
-        elif method == 'ridge_nnls':
-            # Ridge + 음수 제약 (2단계)
-            model = Ridge(alpha=lambda_param, fit_intercept=False)
-            gamma = model.fit(A, b).coef_
-            gamma = np.maximum(gamma, 0)  # 음수 → 0
-        
-        elif method == 'lasso':
-            # LASSO (희소성)
-            model = Lasso(alpha=lambda_param, fit_intercept=False, max_iter=5000)
-            gamma = model.fit(A, b).coef_
-            gamma = np.maximum(gamma, 0)
-        
-        elif method == 'nnls':
-            # Non-Negative Least Squares
-            gamma, _ = nnls(A, b)
-        
-        else:
-            raise ValueError(f"Unknown method: {method}")
-        
-        return gamma
+    def _compute_gcv(self, A, z, L, lambda_val):
+        """Compute Generalized Cross-Validation score."""
+        try:
+            ATA = A.T @ A
+            LTL = L.T @ L
+            ATz = A.T @ z
+            
+            M = ATA + lambda_val * LTL
+            gamma = solve(M, ATz)
+            
+            r = z - A @ gamma
+            rss = np.sum(r**2)
+            
+            try:
+                M_inv = np.linalg.inv(M)
+                trace = np.trace(A @ M_inv @ A.T)
+            except:
+                trace = A.shape[0]
+            
+            dof = A.shape[0] - trace
+            
+            if dof <= 0:
+                return np.inf
+            
+            gcv = rss / (dof ** 2)
+            return gcv
+            
+        except:
+            return np.inf
     
-    def _compute_statistics(self, tau, gamma):
-        """DRT 통계량 계산"""
-        idx_max = np.argmax(gamma)
-        gamma_max = gamma[idx_max]
-        tau_at_max = tau[idx_max]
+    def solve_drt(self, n_tau=100, lambda_val=None, lambda_auto=True, 
+                  non_negative=False, verbose=True):
+        """Solve DRT using Tikhonov regularization."""
+        if self.frequency is None:
+            raise ValueError("Load data first using load_data()")
         
-        # ⟨τ⟩ 가중평균
-        mean_tau = np.sum(tau * gamma) / np.sum(gamma)
+        self._setup_tau_grid(n_tau)
+        if verbose:
+            print(f"✓ Tau grid setup: {n_tau} points from {self.tau_grid[0]:.2e} to {self.tau_grid[-1]:.2e} s")
         
-        # 전체 저항 (log scale 적분)
-        total_R = trapz(gamma, x=np.log10(tau))
+        A = self._build_kernel_matrix()
+        z = self._build_data_vector()
+        L = self._regularization_matrix(n_tau, order=2)
         
-        # FWHM (반최대폭)
-        half_height = gamma_max / 2
-        above_half = np.where(gamma >= half_height)[0]
-        if len(above_half) > 1:
-            fwhm_ratio = tau[above_half[-1]] / tau[above_half[0]]
+        if lambda_auto and lambda_val is None:
+            if verbose:
+                print("→ Searching optimal λ via GCV...")
+            
+            lambda_range = np.logspace(-8, 2, 50)
+            gcv_scores = []
+            
+            for lam in lambda_range:
+                gcv = self._compute_gcv(A, z, L, lam)
+                gcv_scores.append(gcv)
+            
+            idx_opt = np.nanargmin(gcv_scores)
+            self.lambda_opt = lambda_range[idx_opt]
+            
+            if verbose:
+                print(f"✓ Optimal λ = {self.lambda_opt:.2e} (GCV = {gcv_scores[idx_opt]:.2e})")
         else:
-            fwhm_ratio = np.nan
+            self.lambda_opt = lambda_val if lambda_val is not None else 1e-4
+            if verbose:
+                print(f"✓ Using λ = {self.lambda_opt:.2e}")
         
-        return {
-            'gamma_max': float(gamma_max),
-            'tau_at_max': float(tau_at_max),
-            'mean_tau': float(mean_tau),
-            'total_R': float(total_R),
-            'fwhm_ratio': float(fwhm_ratio)
+        ATA = A.T @ A
+        LTL = L.T @ L
+        ATz = A.T @ z
+        
+        M = ATA + self.lambda_opt * LTL
+        
+        try:
+            gamma_raw = solve(M, ATz)
+            
+            if non_negative:
+                gamma = np.maximum(gamma_raw, 0)
+            else:
+                gamma = gamma_raw
+            
+            self.gamma = gamma
+            
+            if verbose:
+                print(f"✓ DRT solved, γ range: [{gamma.min():.2e}, {gamma.max():.2e}] Ω")
+            
+        except Exception as e:
+            print(f"✗ Solve failed: {e}")
+            return False
+        
+        self._reconstruct_impedance(A)
+        self._calculate_residuals(z)
+        self._find_peaks()
+        
+        return True
+    
+    def _reconstruct_impedance(self, A):
+        """Reconstruct impedance from gamma and kernel matrix."""
+        n_freq = len(self.frequency)
+        z_reconst = A @ self.gamma
+        
+        self.Z_reconst_real = z_reconst[:n_freq]
+        self.Z_reconst_imag = z_reconst[n_freq:]
+    
+    def _calculate_residuals(self, z):
+        """Calculate fit quality metrics."""
+        z_reconst = np.concatenate([self.Z_reconst_real, self.Z_reconst_imag])
+        residual = z - z_reconst
+        
+        mse = np.mean(residual**2)
+        rmse = np.sqrt(mse)
+        max_err = np.max(np.abs(residual))
+        
+        z_norm = np.linalg.norm(z)
+        relative_error = rmse / z_norm if z_norm > 0 else np.inf
+        
+        self.residual = {
+            'abs': residual,
+            'mse': mse,
+            'rmse': rmse,
+            'max_error': max_err,
+            'relative_error': relative_error
         }
+        
+        self.fit_metrics['rmse'] = rmse
+        self.fit_metrics['relative_error'] = relative_error
     
-    def _find_peaks(self, tau, gamma, prominence_ratio=0.05):
-        """DRT에서 피크 자동 탐지"""
-        threshold = prominence_ratio * np.max(gamma)
+    def _find_peaks(self, height_threshold=0.05):
+        """Detect peaks in DRT distribution."""
+        if self.gamma is None:
+            return
+        
+        max_height = np.max(self.gamma)
+        min_height = height_threshold * max_height
+        
         peaks, properties = find_peaks(
-            gamma,
-            height=threshold,
-            distance=max(1, len(gamma)//20)
+            self.gamma, 
+            height=min_height,
+            distance=max(1, len(self.gamma) // 20)
         )
         
-        peaks_info = []
+        self.peaks_info = []
+        
         for peak_idx in peaks:
-            tau_peak = tau[peak_idx]
-            gamma_peak = gamma[peak_idx]
+            tau_peak = self.tau_grid[peak_idx]
+            gamma_peak = self.gamma[peak_idx]
             
-            # FWHM 범위에서 면적 계산
             half_height = gamma_peak / 2
-            above_half = np.where(gamma >= half_height)[0]
+            fwhm_left = tau_peak
+            fwhm_right = tau_peak
             
-            if len(above_half) > 1:
-                left_idx, right_idx = above_half[0], above_half[-1]
-                area = trapz(gamma[left_idx:right_idx+1], 
-                           x=np.log10(tau[left_idx:right_idx+1]))
-                tau_left, tau_right = tau[left_idx], tau[right_idx]
-            else:
-                # FWHM 못 찾으면 ±0.5 decade
-                tau_left = tau_peak / np.sqrt(10)
-                tau_right = tau_peak * np.sqrt(10)
-                idx_range = np.where((tau >= tau_left) & (tau <= tau_right))[0]
-                if len(idx_range) > 0:
-                    area = trapz(gamma[idx_range], x=np.log10(tau[idx_range]))
-                else:
-                    area = 0
+            for i in range(peak_idx - 1, -1, -1):
+                if self.gamma[i] < half_height:
+                    fwhm_left = self.tau_grid[i]
+                    break
             
-            peaks_info.append({
-                'tau_peak': tau_peak,
-                'gamma_peak': gamma_peak,
-                'area': area,
-                'tau_left': tau_left if len(above_half) > 1 else tau_peak/np.sqrt(10),
-                'tau_right': tau_right if len(above_half) > 1 else tau_peak*np.sqrt(10)
+            for i in range(peak_idx + 1, len(self.gamma)):
+                if self.gamma[i] < half_height:
+                    fwhm_right = self.tau_grid[i]
+                    break
+            
+            dlog_tau = np.log(self.tau_grid[1] / self.tau_grid[0])
+            resistance_contrib = np.sum(self.gamma[max(0, peak_idx-5):min(len(self.gamma), peak_idx+6)]) * dlog_tau
+            
+            self.peaks_info.append({
+                'tau': tau_peak,
+                'gamma': gamma_peak,
+                'resistance': resistance_contrib,
+                'index': peak_idx,
+                'fwhm_range': (fwhm_left, fwhm_right)
             })
+    
+    def get_summary(self):
+        """Get summary statistics of DRT analysis."""
+        if self.gamma is None:
+            return None
         
-        return peaks_info
-    
-    def _peaks_to_dataframe(self, peaks_info):
-        """피크 정보를 DataFrame으로 변환"""
-        if not peaks_info:
-            return pd.DataFrame()
+        summary = {
+            'n_peaks': len(self.peaks_info) if self.peaks_info else 0,
+            'gamma_max': np.max(self.gamma),
+            'gamma_min': np.min(self.gamma),
+            'total_resistance': np.sum(self.gamma) * np.log(self.tau_grid[1] / self.tau_grid[0]),
+            'lambda_opt': self.lambda_opt,
+            'fit_metrics': self.fit_metrics,
+            'residual_stats': {
+                'rmse': self.residual['rmse'],
+                'relative_error': self.residual['relative_error'],
+                'max_error': self.residual['max_error']
+            } if self.residual else None
+        }
         
-        data = []
-        for i, peak in enumerate(peaks_info):
-            data.append({
-                'Peak #': i + 1,
-                'τ_peak (s)': f"{peak['tau_peak']:.2e}",
-                'γ_peak (A/Ω)': f"{peak['gamma_peak']:.6f}",
-                'ΔR (Ω)': f"{peak['area']:.4f}",
-                'log₁₀(τ_peak)': f"{np.log10(peak['tau_peak']):.2f}"
-            })
+        return summary
+
+
+def generate_test_eis(circuit_type='RC', frequency=None, seed=42):
+    """Generate synthetic EIS data for testing."""
+    np.random.seed(seed)
+    
+    if frequency is None:
+        frequency = np.logspace(2, 6, 50)
+    
+    omega = 2 * np.pi * frequency
+    
+    if circuit_type == 'RC':
+        R0, R1, C1 = 10, 100, 1e-6
+        Z_real = R0 + R1 / (1 + (omega * R1 * C1)**2)
+        Z_imag = (omega * R1**2 * C1) / (1 + (omega * R1 * C1)**2)
         
-        return pd.DataFrame(data)
-
-
-# ==================== 편의 함수 ====================
-
-def compute_drt(freq, z_real, z_imag, n_tau=150, lambda_param=1e-3, 
-                reg_order=2, method='ridge'):
-    """
-    간단한 DRT 계산 함수 (클래스 래퍼)
-    """
-    calc = DRTCalculator(freq, z_real, z_imag)
-    return calc.compute(n_tau=n_tau, lambda_param=lambda_param,
-                       reg_order=reg_order, method=method)
-
-
-def create_synthetic_eis(elements, freq=None):
-    """
-    테스트용 합성 EIS 데이터 생성
+    elif circuit_type == 'RC-RC':
+        R0, R1, C1, R2, C2 = 10, 50, 1e-6, 50, 1e-5
+        Z1_real = R1 / (1 + (omega * R1 * C1)**2)
+        Z1_imag = (omega * R1**2 * C1) / (1 + (omega * R1 * C1)**2)
+        Z2_real = R2 / (1 + (omega * R2 * C2)**2)
+        Z2_imag = (omega * R2**2 * C2) / (1 + (omega * R2 * C2)**2)
+        Z_real = R0 + Z1_real + Z2_real
+        Z_imag = Z1_imag + Z2_imag
+        
+    else:  # Randles
+        R0, Rct, C_dl = 5, 100, 1e-5
+        sigma_w = 50
+        Z_w = sigma_w / np.sqrt(omega + 1e-10) * (1 - 1j)
+        Z_real = R0 + Rct / (1 + (omega * Rct * C_dl)**2) + Z_w.real
+        Z_imag = (omega * Rct**2 * C_dl) / (1 + (omega * Rct * C_dl)**2) + Z_w.imag
     
-    Parameters
-    ----------
-    elements : dict
-        {'R0': 10, 'R': [100, 50], 'C': [1e-6, 1e-5]}
-        R0: 오믹 저항
-        R, C: 직렬 RC 쌍
-    freq : array, optional
-        주파수 (기본: 0.01 ~ 100kHz)
+    noise_level = 0.01
+    Z_real += np.random.normal(0, noise_level * np.mean(Z_real), len(Z_real))
+    Z_imag += np.random.normal(0, noise_level * np.mean(Z_imag), len(Z_imag))
     
-    Returns
-    -------
-    dict : {'freq', 'z_real', 'z_imag'}
-    """
-    if freq is None:
-        freq = np.logspace(-2, 5, 50)
-    
-    omega = 2 * np.pi * freq
-    z = elements.get('R0', 0) * np.ones_like(omega)
-    
-    R_list = elements.get('R', [])
-    C_list = elements.get('C', [])
-    
-    for R, C in zip(R_list, C_list):
-        z_rc = R / (1 + 1j * omega * R * C)
-        z += z_rc
-    
-    z_real = np.real(z)
-    z_imag = -np.imag(z)  # 음수로 저장 (표준)
-    
-    return {
-        'freq': freq,
-        'z_real': z_real,
-        'z_imag': np.abs(z_imag)
-    }
-
-
-if __name__ == "__main__":
-    # 테스트: Single ZARC
-    print("=" * 60)
-    print("Test: Single ZARC (R=100 Ω, C=1 µF)")
-    print("=" * 60)
-    
-    test_data = create_synthetic_eis({'R0': 10, 'R': [100], 'C': [1e-6]})
-    
-    result = compute_drt(
-        freq=test_data['freq'],
-        z_real=test_data['z_real'],
-        z_imag=test_data['z_imag'],
-        n_tau=100,
-        lambda_param=1e-3,
-        method='ridge'
-    )
-    
-    print(f"\nResults:")
-    print(f"  τ_peak = {result['stats']['tau_at_max']:.2e} s")
-    print(f"  γ_max = {result['stats']['gamma_max']:.6f} A/Ω")
-    print(f"  Total R ≈ {result['stats']['total_R']:.2f} Ω")
-    print(f"  RMSE = {result['rmse']:.2e}")
-    print(f"  Rel Error = {result['rel_error']*100:.2f}%")
-    print(f"\nPeaks found: {len(result['peaks_info'])}")
-    if result['peaks_df'] is not None:
-        print(result['peaks_df'].to_string())
+    return frequency, Z_real, np.abs(Z_imag)

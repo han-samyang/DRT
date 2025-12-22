@@ -70,15 +70,17 @@ metadata = {}
 
 if data_source == "Upload File":
     uploaded_file = st.sidebar.file_uploader(
-        "Upload CSV or Excel file",
-        type=["csv", "xlsx", "xls"],
-        help="Format: frequency(Hz) | Z_real(Ω) | Z_imag(Ω)"
+        "Upload CSV, Excel, or TXT file",
+        type=["csv", "xlsx", "xls", "txt"],
+        help="Format: frequency(Hz) | Z_real(Ω) | -Z_imag(Ω)"
     )
     
     if uploaded_file:
         try:
             if uploaded_file.name.endswith('.csv'):
                 df = pd.read_csv(uploaded_file)
+            elif uploaded_file.name.endswith('.txt'):
+                df = pd.read_csv(uploaded_file, sep='\t', skiprows=0)
             else:
                 df = pd.read_excel(uploaded_file)
             
@@ -87,14 +89,14 @@ if data_source == "Upload File":
             z_real_col = None
             z_imag_col = None
             
-            col_names_lower = [c.lower() for c in df.columns]
+            col_names_lower = [c.lower().strip() for c in df.columns]
             
             for i, cn in enumerate(col_names_lower):
-                if any(x in cn for x in ['freq', 'f', 'ω']):
+                if any(x in cn for x in ['freq', 'f ', 'ω', 'hz']):
                     freq_col = df.columns[i]
-                elif any(x in cn for x in ["z'", 'zreal', 'zr', "z'", 're']):
+                elif any(x in cn for x in ["z'", 'zreal', 'zr', "z'", 're(z)', 'real']):
                     z_real_col = df.columns[i]
-                elif any(x in cn for x in ['z"', 'zimag', 'zi', "z''", 'im']):
+                elif any(x in cn for x in ['z"', 'zimag', 'zi', "z''", 'im(z)', 'imag', '-im(z)']):
                     z_imag_col = df.columns[i]
             
             # Fallback to first 3 columns if auto-detect fails
@@ -168,8 +170,8 @@ else:
 
 non_negative = st.sidebar.checkbox(
     "Non-negative γ(τ)",
-    value=False,
-    help="Enforce γ(τ) ≥ 0 (physical constraint)"
+    value=True,
+    help="Enforce γ(τ) ≥ 0 (physical constraint for impedance) - Recommended: ON"
 )
 
 # ============================================================================
@@ -271,18 +273,21 @@ if 'drt_analyzer' in st.session_state:
                 fig_drt.add_trace(go.Scatter(
                     x=peak_taus,
                     y=peak_gammas,
-                    mode='markers',
+                    mode='markers+text',
                     name='Peaks',
-                    marker=dict(color='red', size=10, symbol='star')
+                    marker=dict(color='red', size=10, symbol='star'),
+                    text=[f"Peak {i+1}" for i in range(len(peak_taus))],
+                    textposition='top center'
                 ))
             
-            fig_drt.update_xaxes(type='log', title='Time Constant τ (s)')
-            fig_drt.update_yaxes(title='γ(τ) (Ω/log(s))')
+            fig_drt.update_xaxes(type='log', title='Time Constant τ (s)', titlefont=dict(size=12))
+            fig_drt.update_yaxes(title='γ(τ) (Ω/log(s))', titlefont=dict(size=12))
             fig_drt.update_layout(
                 title='Distribution of Relaxation Times (DRT)',
                 height=500,
                 hovermode='x unified',
-                template='plotly_white'
+                template='plotly_white',
+                font=dict(size=11)
             )
             
             st.plotly_chart(fig_drt, use_container_width=True)
@@ -310,27 +315,31 @@ if 'drt_analyzer' in st.session_state:
                 x=z_real,
                 y=z_imag,
                 mode='markers',
-                name='Experimental',
-                marker=dict(color='blue', size=8),
+                name='Experimental EIS',
+                marker=dict(color='blue', size=6, opacity=0.7),
                 text=[f'{f:.0f} Hz' for f in freq],
-                hoverinfo='text'
+                hoverinfo='text+x+y',
+                hovertemplate='<b>%{text}</b><br>Z\'=%{x:.2f}Ω<br>-Z"=%{y:.2f}Ω<extra></extra>'
             ))
             
             fig_nyquist.add_trace(go.Scatter(
                 x=analyzer.Z_reconst_real,
                 y=analyzer.Z_reconst_imag,
                 mode='lines',
-                name='Reconstructed',
-                line=dict(color='red', width=2, dash='dash')
+                name='DRT Reconstructed',
+                line=dict(color='red', width=2.5),
+                hovertemplate='Z\'=%{x:.2f}Ω<br>-Z"=%{y:.2f}Ω<extra></extra>'
             ))
             
-            fig_nyquist.update_xaxes(title="Z' (Ω)")
-            fig_nyquist.update_yaxes(title="-Z'' (Ω)")
+            fig_nyquist.update_xaxes(title="Z' (Ω)", titlefont=dict(size=12))
+            fig_nyquist.update_yaxes(title="-Z'' (Ω)", titlefont=dict(size=12))
             fig_nyquist.update_layout(
-                title='Nyquist Plot',
+                title='Nyquist Plot: EIS vs DRT Reconstruction',
                 height=500,
                 hovermode='closest',
-                template='plotly_white'
+                template='plotly_white',
+                font=dict(size=11),
+                legend=dict(x=0.02, y=0.98)
             )
             
             st.plotly_chart(fig_nyquist, use_container_width=True)
@@ -345,46 +354,60 @@ if 'drt_analyzer' in st.session_state:
             
             fig_bode = go.Figure()
             
+            # Magnitude - experimental
             fig_bode.add_trace(go.Scatter(
                 x=freq, y=mag,
                 mode='markers',
-                name='|Z| (exp)',
-                marker=dict(color='blue', size=6),
-                yaxis='y1'
+                name='|Z| (Experimental)',
+                marker=dict(color='blue', size=6, opacity=0.7),
+                yaxis='y1',
+                hovertemplate='f=%{x:.0f} Hz<br>|Z|=%{y:.2f}Ω<extra></extra>'
             ))
             
+            # Magnitude - reconstructed
             fig_bode.add_trace(go.Scatter(
                 x=freq, y=mag_reconst,
                 mode='lines',
-                name='|Z| (fit)',
-                line=dict(color='red', dash='dash'),
-                yaxis='y1'
+                name='|Z| (DRT Fit)',
+                line=dict(color='red', width=2.5),
+                yaxis='y1',
+                hovertemplate='f=%{x:.0f} Hz<br>|Z|=%{y:.2f}Ω<extra></extra>'
             ))
             
+            # Phase - experimental
             fig_bode.add_trace(go.Scatter(
                 x=freq, y=phase,
                 mode='markers',
-                name='Phase (exp)',
-                marker=dict(color='green', size=6),
-                yaxis='y2'
+                name='Phase (Experimental)',
+                marker=dict(color='green', size=6, opacity=0.7),
+                yaxis='y2',
+                hovertemplate='f=%{x:.0f} Hz<br>Phase=%{y:.1f}°<extra></extra>'
             ))
             
+            # Phase - reconstructed
             fig_bode.add_trace(go.Scatter(
                 x=freq, y=phase_reconst,
                 mode='lines',
-                name='Phase (fit)',
-                line=dict(color='orange', dash='dash'),
-                yaxis='y2'
+                name='Phase (DRT Fit)',
+                line=dict(color='orange', width=2.5),
+                yaxis='y2',
+                hovertemplate='f=%{x:.0f} Hz<br>Phase=%{y:.1f}°<extra></extra>'
             ))
             
-            fig_bode.update_xaxes(type='log', title='Frequency (Hz)')
-            fig_bode.update_yaxes(title='|Z| (Ω)', secondary_y=False)
+            fig_bode.update_xaxes(type='log', title='Frequency (Hz)', titlefont=dict(size=12))
+            fig_bode.update_yaxes(
+                title='|Z| (Ω)', 
+                secondary_y=False,
+                titlefont=dict(size=12)
+            )
             fig_bode.update_layout(
-                yaxis2=dict(title='Phase (°)', overlaying='y', side='right'),
-                title='Bode Plot',
+                yaxis2=dict(title='Phase (°)', overlaying='y', side='right', titlefont=dict(size=12)),
+                title='Bode Plot: Impedance Magnitude and Phase',
                 height=500,
                 hovermode='x unified',
-                template='plotly_white'
+                template='plotly_white',
+                font=dict(size=11),
+                legend=dict(x=0.02, y=0.98)
             )
             
             st.plotly_chart(fig_bode, use_container_width=True)

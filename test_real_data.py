@@ -102,14 +102,15 @@ if success:
     
     # Plot 1: DRT Distribution
     ax = axes[0, 0]
-    ax.semilogx(analyzer.tau_grid, analyzer.gamma, 'b-', linewidth=2.5, label='γ(τ)')
-    ax.fill_between(analyzer.tau_grid, 0, analyzer.gamma, alpha=0.3, color='blue')
+    gamma_differential = analyzer.gamma / np.log(10)  # γ'(ln τ) = γ(τ)/ln(10)
+    ax.semilogx(analyzer.tau_grid, gamma_differential, 'b-', linewidth=2.5, label="γ'(ln τ)")
+    ax.fill_between(analyzer.tau_grid, 0, gamma_differential, alpha=0.3, color='blue')
     if analyzer.peaks_info:
         peaks_tau = [p['tau'] for p in analyzer.peaks_info]
-        peaks_gamma = [p['gamma'] for p in analyzer.peaks_info]
+        peaks_gamma = [p['gamma'] / np.log(10) for p in analyzer.peaks_info]
         ax.plot(peaks_tau, peaks_gamma, 'r*', markersize=15, label='Peaks')
     ax.set_xlabel('Time Constant τ (s)', fontsize=11)
-    ax.set_ylabel('γ(τ) (Ω/log(s))', fontsize=11)
+    ax.set_ylabel("γ'(ln τ) (Ω)", fontsize=11)
     ax.set_title('Distribution of Relaxation Times (DRT)', fontsize=12, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=10)

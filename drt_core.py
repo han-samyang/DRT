@@ -38,15 +38,22 @@ class DRTAnalyzer:
         self.fit_metrics = {}
         
     def load_data(self, frequency, Z_real, Z_imag):
-        """Load and preprocess EIS data."""
+        """Load and preprocess EIS data.
+        
+        Note: Z_imag will be converted to absolute value (positive imaginary impedance)
+              This handles both -Z_imag and Z_imag input formats.
+        """
         frequency = np.asarray(frequency, dtype=float)
         Z_real = np.asarray(Z_real, dtype=float)
         Z_imag = np.asarray(Z_imag, dtype=float)
         
+        # Convert to positive values for physical meaning
+        Z_imag_abs = np.abs(Z_imag)
+        
         sort_idx = np.argsort(frequency)
         self.frequency = frequency[sort_idx]
         self.Z_real = Z_real[sort_idx]
-        self.Z_imag = np.abs(Z_imag[sort_idx])
+        self.Z_imag = Z_imag_abs[sort_idx]
         
         unique_f, unique_idx = np.unique(self.frequency, return_index=True)
         self.frequency = unique_f
@@ -136,8 +143,19 @@ class DRTAnalyzer:
             return np.inf
     
     def solve_drt(self, n_tau=100, lambda_val=None, lambda_auto=True, 
-                  non_negative=False, verbose=True):
-        """Solve DRT using Tikhonov regularization."""
+                  non_negative=True, verbose=True):
+        """Solve DRT using Tikhonov regularization.
+        
+        Parameters:
+            n_tau (int): Number of tau points
+            lambda_val (float): Regularization parameter (if None, auto-select)
+            lambda_auto (bool): Use GCV for auto lambda selection
+            non_negative (bool): Enforce γ(τ) ≥ 0 (default: True for physical meaning)
+            verbose (bool): Print progress info
+            
+        Returns:
+            success (bool): True if solution converged
+        """
         if self.frequency is None:
             raise ValueError("Load data first using load_data()")
         
@@ -230,42 +248,63 @@ class DRTAnalyzer:
         self.fit_metrics['rmse'] = rmse
         self.fit_metrics['relative_error'] = relative_error
     
-    def _find_peaks(self, height_threshold=0.05):
-        """Detect peaks in DRT distribution."""
+    def _find_peaks(self, height_threshold=0.01):
+        """Detect peaks in DRT distribution.
+        
+        Parameters:
+            height_threshold (float): Relative height threshold (0-1) 
+                                    Lower value = more sensitive peak detection
+        """
         if self.gamma is None:
             return
         
-        max_height = np.max(self.gamma)
+        # Filter out very small or negative values
+        gamma_filtered = np.maximum(self.gamma, 0)  # Set negatives to 0
+        
+        if np.max(gamma_filtered) == 0:
+            self.peaks_info = []
+            return
+        
+        # Find peaks with adaptive threshold
+        max_height = np.max(gamma_filtered)
         min_height = height_threshold * max_height
         
         peaks, properties = find_peaks(
-            self.gamma, 
+            gamma_filtered, 
             height=min_height,
-            distance=max(1, len(self.gamma) // 20)
+            distance=max(1, len(gamma_filtered) // 30),  # More sensitive distance
+            prominence=min_height / 2
         )
         
         self.peaks_info = []
         
         for peak_idx in peaks:
             tau_peak = self.tau_grid[peak_idx]
-            gamma_peak = self.gamma[peak_idx]
+            gamma_peak = gamma_filtered[peak_idx]
             
+            if gamma_peak <= 0:  # Skip zero or negative peaks
+                continue
+            
+            # Estimate FWHM
             half_height = gamma_peak / 2
             fwhm_left = tau_peak
             fwhm_right = tau_peak
             
             for i in range(peak_idx - 1, -1, -1):
-                if self.gamma[i] < half_height:
+                if gamma_filtered[i] < half_height:
                     fwhm_left = self.tau_grid[i]
                     break
             
-            for i in range(peak_idx + 1, len(self.gamma)):
-                if self.gamma[i] < half_height:
+            for i in range(peak_idx + 1, len(gamma_filtered)):
+                if gamma_filtered[i] < half_height:
                     fwhm_right = self.tau_grid[i]
                     break
             
+            # Approximate resistance contribution (area under peak in log-space)
             dlog_tau = np.log(self.tau_grid[1] / self.tau_grid[0])
-            resistance_contrib = np.sum(self.gamma[max(0, peak_idx-5):min(len(self.gamma), peak_idx+6)]) * dlog_tau
+            idx_left = max(0, peak_idx - 5)
+            idx_right = min(len(gamma_filtered), peak_idx + 6)
+            resistance_contrib = np.sum(gamma_filtered[idx_left:idx_right]) * dlog_tau
             
             self.peaks_info.append({
                 'tau': tau_peak,

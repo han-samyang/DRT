@@ -255,20 +255,25 @@ if 'drt_analyzer' in st.session_state:
         with col1:
             fig_drt = go.Figure()
             
+            # Convert γ(τ) to differential form: γ'(ln τ) = γ(τ)/ln(10)
+            # This is the standard format in literature
+            gamma_differential = analyzer.gamma / np.log(10)
+            
             fig_drt.add_trace(go.Scatter(
                 x=analyzer.tau_grid,
-                y=analyzer.gamma,
+                y=gamma_differential,
                 mode='lines',
-                name='γ(τ)',
+                name="γ'(ln τ)",
                 line=dict(color='#1f77b4', width=3),
                 fill='tozeroy',
-                fillcolor='rgba(31, 119, 180, 0.3)'
+                fillcolor='rgba(31, 119, 180, 0.3)',
+                hovertemplate='τ=%{x:.2e}s<br>γ\'=%{y:.2e}Ω<extra></extra>'
             ))
             
             # Mark peaks
             if analyzer.peaks_info:
                 peak_taus = [p['tau'] for p in analyzer.peaks_info]
-                peak_gammas = [p['gamma'] for p in analyzer.peaks_info]
+                peak_gammas = [p['gamma'] / np.log(10) for p in analyzer.peaks_info]
                 
                 fig_drt.add_trace(go.Scatter(
                     x=peak_taus,
@@ -277,11 +282,12 @@ if 'drt_analyzer' in st.session_state:
                     name='Peaks',
                     marker=dict(color='red', size=10, symbol='star'),
                     text=[f"Peak {i+1}" for i in range(len(peak_taus))],
-                    textposition='top center'
+                    textposition='top center',
+                    hovertemplate='τ=%{x:.2e}s<br>γ\'=%{y:.2e}Ω<extra></extra>'
                 ))
             
             fig_drt.update_xaxes(type='log', title='Time Constant τ (s)', titlefont=dict(size=12))
-            fig_drt.update_yaxes(title='γ(τ) (Ω/log(s))', titlefont=dict(size=12))
+            fig_drt.update_yaxes(title="γ'(ln τ) (Ω)", titlefont=dict(size=12))
             fig_drt.update_layout(
                 title='Distribution of Relaxation Times (DRT)',
                 height=500,
@@ -345,7 +351,7 @@ if 'drt_analyzer' in st.session_state:
             st.plotly_chart(fig_nyquist, use_container_width=True)
         
         with col2:
-            # Bode Plot
+            # Bode Plot - Improved version for compatibility
             mag = np.sqrt(z_real**2 + z_imag**2)
             phase = np.arctan2(z_imag, z_real) * 180 / np.pi
             
@@ -360,7 +366,7 @@ if 'drt_analyzer' in st.session_state:
                 mode='markers',
                 name='|Z| (Experimental)',
                 marker=dict(color='blue', size=6, opacity=0.7),
-                yaxis='y1',
+                yaxis='y',
                 hovertemplate='f=%{x:.0f} Hz<br>|Z|=%{y:.2f}Ω<extra></extra>'
             ))
             
@@ -370,7 +376,7 @@ if 'drt_analyzer' in st.session_state:
                 mode='lines',
                 name='|Z| (DRT Fit)',
                 line=dict(color='red', width=2.5),
-                yaxis='y1',
+                yaxis='y',
                 hovertemplate='f=%{x:.0f} Hz<br>|Z|=%{y:.2f}Ω<extra></extra>'
             ))
             
@@ -394,14 +400,22 @@ if 'drt_analyzer' in st.session_state:
                 hovertemplate='f=%{x:.0f} Hz<br>Phase=%{y:.1f}°<extra></extra>'
             ))
             
-            fig_bode.update_xaxes(type='log', title='Frequency (Hz)', titlefont=dict(size=12))
-            fig_bode.update_yaxes(
-                title='|Z| (Ω)', 
-                secondary_y=False,
-                titlefont=dict(size=12)
-            )
             fig_bode.update_layout(
-                yaxis2=dict(title='Phase (°)', overlaying='y', side='right', titlefont=dict(size=12)),
+                xaxis=dict(
+                    type='log',
+                    title='Frequency (Hz)',
+                    titlefont=dict(size=12)
+                ),
+                yaxis=dict(
+                    title='|Z| (Ω)',
+                    titlefont=dict(size=12)
+                ),
+                yaxis2=dict(
+                    title='Phase (°)',
+                    overlaying='y',
+                    side='right',
+                    titlefont=dict(size=12)
+                ),
                 title='Bode Plot: Impedance Magnitude and Phase',
                 height=500,
                 hovermode='x unified',

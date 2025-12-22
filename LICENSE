@@ -1,0 +1,46 @@
+MIT License
+
+Copyright (c) 2024 [Your Name/Organization]
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+Based on:
+  - pyDRTtools (https://github.com/ciuccislab/pyDRTtools)
+    Copyright (c) 2015-2024 Francesco Ciucci and contributors
+
+Reference Publications:
+  - Wan, T. H., Saccoccio, M., Chen, C., & Ciucci, F. (2015)
+    "Influence of the discretization methods on the distribution of 
+    relaxation times deconvolution"
+    Electrochimica Acta, 184, 483-499
+    https://doi.org/10.1016/j.electacta.2015.09.097
+
+  - Liu, J., & Ciucci, F. (2019)
+    "The Gaussian process distribution of relaxation times: A machine learning 
+    tool for the analysis and prediction of electrochemical impedance 
+    spectroscopy data"
+    Electrochimica Acta, 135316
+    https://doi.org/10.1016/j.electacta.2019.135316
+
+  - Ciucci, F. (2022)
+    "Distribution of Relaxation Times Analysis"
+    Joule, 6, 1172-1198
+    https://doi.org/10.1016/j.joule.2022.04.003

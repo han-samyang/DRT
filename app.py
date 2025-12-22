@@ -1,21 +1,26 @@
 """
-DRT Analysis Web Application using Streamlit
-Based on pyDRTtools methodology (Ciucci's Lab)
+DRT Analysis Tool - Streamlit Web Application
+==============================================
+Interactive tool for EIS data analysis using DRT transformation.
 
-Version: 0.1 (MVP)
+License: MIT
 """
 
 import streamlit as st
-import pandas as pd
 import numpy as np
-from io import BytesIO
+import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import plotly.express as px
+from io import BytesIO
+import json
+from datetime import datetime
 
-# DRT 핵심 모듈 임포트
-from drt_core import DRTCalculator, create_synthetic_eis
+from drt_core import DRTAnalyzer, generate_test_eis
 
-# ==================== 페이지 설정 ====================
+# ============================================================================
+# PAGE CONFIGURATION
+# ============================================================================
+
 st.set_page_config(
     page_title="DRT Analysis Tool",
     page_icon="⚡",
@@ -23,606 +28,621 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# CSS 스타일
 st.markdown("""
 <style>
-    .metric-box {
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        margin-bottom: 0.5rem;
+    }
+    .subtitle {
+        font-size: 1.1rem;
+        color: #666;
+        margin-bottom: 2rem;
+    }
+    .info-box {
         background-color: #f0f2f6;
-        padding: 10px;
-        border-radius: 5px;
-        margin: 5px 0;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #1f77b4;
+        margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== 세션 상태 초기화 ====================
-if 'eis_data' not in st.session_state:
-    st.session_state.eis_data = None
-if 'drt_result' not in st.session_state:
-    st.session_state.drt_result = None
-if 'analysis_done' not in st.session_state:
-    st.session_state.analysis_done = False
+# ============================================================================
+# SIDEBAR - INPUT SETTINGS
+# ============================================================================
 
-# ==================== 사이드바: 입력 설정 ====================
-with st.sidebar:
-    st.title("📋 DRT 분석 설정")
-    
-    # 데이터 입력 방식 선택
-    input_mode = st.radio(
-        "데이터 입력 방식",
-        ["📁 파일 업로드", "🧪 합성 데이터 (테스트)"]
+st.sidebar.markdown("## ⚙️ Input Data")
+
+data_source = st.sidebar.radio(
+    "Data Source",
+    ["Upload File", "Sample Data"],
+    help="Choose between uploading your own EIS data or using sample test data"
+)
+
+freq = None
+z_real = None
+z_imag = None
+metadata = {}
+
+if data_source == "Upload File":
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload CSV or Excel file",
+        type=["csv", "xlsx", "xls"],
+        help="Format: frequency(Hz) | Z_real(Ω) | Z_imag(Ω)"
     )
     
-    # ===== 파일 업로드 모드 =====
-    if input_mode == "📁 파일 업로드":
-        st.subheader("EIS 파일 업로드")
-        
-        uploaded_file = st.file_uploader(
-            "CSV 또는 Excel 파일 선택",
-            type=['csv', 'xlsx', 'xls'],
-            help="필수 컬럼: 주파수(Hz), Z'(Ω), Z''(Ω)"
-        )
-        
-        if uploaded_file is not None:
-            # 파일 로드
-            try:
-                if uploaded_file.name.endswith('.csv'):
-                    df = pd.read_csv(uploaded_file)
-                else:
-                    df = pd.read_excel(uploaded_file)
-                
-                st.success(f"✅ 파일 로드 성공: {len(df)} 포인트")
-                
-                # 컬럼 매핑
-                st.subheader("컬럼 선택")
-                
-                freq_col = st.selectbox(
-                    "주파수 컬럼",
-                    df.columns,
-                    help="Hz 단위"
-                )
-                
-                zreal_col = st.selectbox(
-                    "Z' (실수부) 컬럼",
-                    df.columns,
-                    help="Ω 단위"
-                )
-                
-                zimag_col = st.selectbox(
-                    "Z'' (허수부) 컬럼",
-                    df.columns,
-                    help="Ω 단위"
-                )
-                
-                # Zimag 부호 처리
-                zimag_sign = st.radio(
-                    "Z'' 부호 확인",
-                    ["-Z'' (표준, 음수로 저장)", "Z'' (양수로 저장)"],
-                    help="대부분의 경우 음수로 저장됨"
-                )
-                
-                # 데이터 추출
-                freq = df[freq_col].values.astype(float)
-                z_real = df[zreal_col].values.astype(float)
-                z_imag = df[zimag_col].values.astype(float)
-                
-                # 부호 처리
-                if zimag_sign == "-Z'' (표준, 음수로 저장)":
-                    z_imag = np.abs(z_imag)  # 절댓값 취함
-                else:
-                    z_imag = np.abs(z_imag)
-                
-                st.session_state.eis_data = {
-                    'freq': freq,
-                    'z_real': z_real,
-                    'z_imag': z_imag
-                }
-                
-                # 데이터 미리보기
-                with st.expander("📊 데이터 미리보기"):
-                    preview_df = pd.DataFrame({
-                        'Frequency (Hz)': freq[:5],
-                        "Z' (Ω)": z_real[:5],
-                        "Z'' (Ω)": z_imag[:5]
-                    })
-                    st.dataframe(preview_df)
-                    st.caption(f"... 총 {len(freq)} 포인트")
+    if uploaded_file:
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
             
-            except Exception as e:
-                st.error(f"❌ 파일 로드 실패: {e}")
-    
-    # ===== 합성 데이터 모드 =====
-    else:
-        st.subheader("합성 EIS 데이터 (테스트)")
-        
-        test_case = st.selectbox(
-            "테스트 케이스",
-            [
-                "Single ZARC (R=100Ω, C=1µF)",
-                "Two ZARC Series (100Ω+50Ω)",
-                "Custom"
-            ]
-        )
-        
-        if test_case == "Single ZARC (R=100Ω, C=1µF)":
-            synthetic = create_synthetic_eis(
-                {'R0': 10, 'R': [100], 'C': [1e-6]}
-            )
-        elif test_case == "Two ZARC Series (100Ω+50Ω)":
-            synthetic = create_synthetic_eis(
-                {'R0': 10, 'R': [100, 50], 'C': [1e-6, 1e-5]}
-            )
-        else:
-            R0 = st.number_input("R₀ (Ω)", value=10.0)
-            R1 = st.number_input("R₁ (Ω)", value=100.0)
-            C1 = st.number_input("C₁ (F)", value=1e-6, format="%.2e")
+            # Auto-detect column names
+            freq_col = None
+            z_real_col = None
+            z_imag_col = None
             
-            synthetic = create_synthetic_eis(
-                {'R0': R0, 'R': [R1], 'C': [C1]}
-            )
-        
-        st.session_state.eis_data = synthetic
-        st.success("✅ 합성 데이터 생성 완료")
-    
-    # ===== DRT 파라미터 설정 =====
-    if st.session_state.eis_data is not None:
-        st.divider()
-        st.subheader("DRT 파라미터")
-        
-        n_tau = st.slider(
-            "τ 그리드 포인트 수",
-            min_value=50,
-            max_value=300,
-            value=150,
-            step=10,
-            help="시간상수 그리드의 해상도"
-        )
-        
-        # 규제화 강도 (로그 스케일)
-        lambda_exp = st.slider(
-            "규제화 λ = 10^x",
-            min_value=-6,
-            max_value=0,
-            value=-3,
-            step=1,
-            help="작을수록: 데이터 적합성 ↑, 노이즈 민감\n"
-                 "클수록: 평탄함 ↑, 정보 손실"
-        )
-        lambda_param = 10 ** lambda_exp
-        
-        # 규제화 방법
-        reg_method = st.radio(
-            "규제화 방법",
-            [
-                ("Ridge (L2) - 표준", "ridge"),
-                ("Ridge + 음수제약 (NNLS)", "ridge_nnls"),
-                ("LASSO (희소성)", "lasso"),
-                ("순수 NNLS", "nnls")
-            ],
-            format_func=lambda x: x[0],
-            help="Ridge: 안정적\n"
-                 "NNLS: 음수 제약\n"
-                 "LASSO: 희소한 피크"
-        )
-        reg_method = reg_method[1]  # 투플에서 값 추출
-        
-        # 규제화 차수
-        reg_order = st.selectbox(
-            "규제화 차수",
-            [(0, "0차 - Ridge (L2)"),
-             (1, "1차 - 평탄도"),
-             (2, "2차 - 곡률 (표준)")],
-            format_func=lambda x: x[1],
-            index=2
-        )
-        reg_order = reg_order[0]
-        
-        # 분석 실행 버튼
-        st.divider()
-        if st.button("🚀 DRT 분석 시작", key='run_analysis', use_container_width=True):
-            with st.spinner("계산 중... ⏳"):
-                try:
-                    calculator = DRTCalculator(
-                        st.session_state.eis_data['freq'],
-                        st.session_state.eis_data['z_real'],
-                        st.session_state.eis_data['z_imag']
-                    )
-                    
-                    st.session_state.drt_result = calculator.compute(
-                        n_tau=n_tau,
-                        lambda_param=lambda_param,
-                        reg_order=reg_order,
-                        method=reg_method
-                    )
-                    
-                    st.session_state.analysis_done = True
-                    st.success("✅ 분석 완료!")
-                
-                except Exception as e:
-                    st.error(f"❌ 분석 실패: {e}")
-                    st.session_state.analysis_done = False
+            col_names_lower = [c.lower() for c in df.columns]
+            
+            for i, cn in enumerate(col_names_lower):
+                if any(x in cn for x in ['freq', 'f', 'ω']):
+                    freq_col = df.columns[i]
+                elif any(x in cn for x in ["z'", 'zreal', 'zr', "z'", 're']):
+                    z_real_col = df.columns[i]
+                elif any(x in cn for x in ['z"', 'zimag', 'zi', "z''", 'im']):
+                    z_imag_col = df.columns[i]
+            
+            # Fallback to first 3 columns if auto-detect fails
+            if freq_col is None or z_real_col is None or z_imag_col is None:
+                st.sidebar.warning("Could not auto-detect columns. Using first 3 columns.")
+                freq_col, z_real_col, z_imag_col = df.columns[0], df.columns[1], df.columns[2]
+            
+            freq = df[freq_col].values
+            z_real = df[z_real_col].values
+            z_imag = np.abs(df[z_imag_col].values)  # Ensure positive
+            
+            st.sidebar.success(f"✓ Loaded {len(freq)} points")
+            
+            # Metadata
+            if 'date' in df.columns or 'Date' in df.columns:
+                metadata['date'] = str(df['Date' if 'Date' in df.columns else 'date'].iloc[0])
+            
+        except Exception as e:
+            st.sidebar.error(f"Error loading file: {e}")
 
-# ==================== 메인 영역: 결과 표시 ====================
-if st.session_state.drt_result is not None and st.session_state.analysis_done:
+else:  # Sample Data
+    sample_type = st.sidebar.selectbox(
+        "Sample Circuit Type",
+        ["RC", "RC-RC", "Randles"],
+        help="Type of equivalent circuit to simulate"
+    )
     
-    result = st.session_state.drt_result
+    n_points = st.sidebar.slider(
+        "Number of frequency points",
+        20, 200, 50
+    )
     
-    # ===== 상단: 요약 통계 =====
-    st.title("⚡ DRT 분석 결과")
+    freq_range = st.sidebar.slider(
+        "Frequency range (log scale)",
+        0.0, 8.0, (1.0, 6.0),
+        help="Min and max frequency in powers of 10 (Hz)"
+    )
     
-    col1, col2, col3, col4 = st.columns(4)
+    frequency = np.logspace(freq_range[0], freq_range[1], n_points)
+    freq, z_real, z_imag = generate_test_eis(sample_type, frequency)
+    metadata['sample_type'] = sample_type
+    st.sidebar.success(f"✓ Generated {sample_type} sample data")
+
+# ============================================================================
+# SIDEBAR - DRT PARAMETERS
+# ============================================================================
+
+st.sidebar.markdown("## 🔧 DRT Parameters")
+
+n_tau = st.sidebar.slider(
+    "τ grid points",
+    30, 300, 100,
+    help="Number of time constant points"
+)
+
+lambda_auto = st.sidebar.checkbox(
+    "Auto-select λ (GCV)",
+    value=True,
+    help="Automatically find optimal regularization parameter"
+)
+
+if not lambda_auto:
+    lambda_val = st.sidebar.slider(
+        "Regularization λ",
+        -8, 2, -4,
+        help="Log10(λ) value"
+    )
+    lambda_val = 10.0 ** lambda_val
+else:
+    lambda_val = None
+
+non_negative = st.sidebar.checkbox(
+    "Non-negative γ(τ)",
+    value=False,
+    help="Enforce γ(τ) ≥ 0 (physical constraint)"
+)
+
+# ============================================================================
+# MAIN CONTENT
+# ============================================================================
+
+st.markdown('<p class="main-header">⚡ DRT Analysis Tool</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Distribution of Relaxation Times from Electrochemical Impedance Spectroscopy</p>', unsafe_allow_html=True)
+
+if freq is None:
+    st.info("👈 Select data source from sidebar to get started")
+    st.stop()
+
+# ============================================================================
+# RUN DRT ANALYSIS
+# ============================================================================
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    run_button = st.button("▶️ Run DRT Analysis", use_container_width=True, type="primary")
+
+with col2:
+    clear_button = st.button("🔄 Clear Cache", use_container_width=True)
+
+with col3:
+    st.write("")  # Spacer
+
+if clear_button:
+    st.cache_data.clear()
+    st.rerun()
+
+if run_button or 'drt_analyzer' not in st.session_state:
     
-    with col1:
-        st.metric(
-            "τ_peak (s)",
-            f"{result['stats']['tau_at_max']:.2e}"
+    # Run analysis
+    with st.spinner("⏳ Analyzing... (this may take a few seconds)"):
+        analyzer = DRTAnalyzer()
+        analyzer.load_data(freq, z_real, z_imag)
+        success = analyzer.solve_drt(
+            n_tau=n_tau,
+            lambda_val=lambda_val,
+            lambda_auto=lambda_auto,
+            non_negative=non_negative,
+            verbose=False
         )
     
-    with col2:
-        st.metric(
-            "γ_max (A/Ω)",
-            f"{result['stats']['gamma_max']:.6f}"
-        )
+    if success:
+        st.session_state.drt_analyzer = analyzer
+        st.session_state.freq = freq
+        st.session_state.z_real = z_real
+        st.session_state.z_imag = z_imag
+        st.session_state.metadata = metadata
+        st.rerun()
+
+if 'drt_analyzer' in st.session_state:
+    analyzer = st.session_state.drt_analyzer
+    freq = st.session_state.freq
+    z_real = st.session_state.z_real
+    z_imag = st.session_state.z_imag
     
-    with col3:
-        st.metric(
-            "Total R (Ω)",
-            f"{result['stats']['total_R']:.2f}"
-        )
+    st.success("✅ Analysis completed successfully!")
     
-    with col4:
-        st.metric(
-            "Rel. Error (%)",
-            f"{result['rel_error']*100:.2f}%"
-        )
+    # ========================================================================
+    # RESULTS TABS
+    # ========================================================================
     
-    # ===== 탭 구성 =====
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 Nyquist",
-        "🌊 Bode",
-        "📈 DRT",
-        "✅ 재구성",
-        "📋 피크"
+        "📊 DRT Plot", 
+        "🌀 Nyquist/Bode",
+        "📈 Fit Quality",
+        "🎯 Peaks",
+        "💾 Export"
     ])
     
-    # ===== Tab 1: Nyquist Plot =====
+    # TAB 1: DRT PLOT
+    # ====================================================================
+    
     with tab1:
-        st.subheader("Nyquist Plot: -Z'' vs Z'")
+        col1, col2 = st.columns([3, 1])
         
-        fig_nyquist = go.Figure()
-        
-        # 데이터 포인트
-        fig_nyquist.add_trace(go.Scatter(
-            x=result['z_real'],
-            y=result['z_imag'],
-            mode='markers',
-            name='Measured',
-            marker=dict(size=8, color='blue', opacity=0.7),
-            hovertemplate='Z\'=%{x:.1f} Ω<br>Z\'\'=%{y:.1f} Ω<extra></extra>'
-        ))
-        
-        # 피팅선 (선택)
-        fig_nyquist.add_trace(go.Scatter(
-            x=result['z_real'],
-            y=result['z_imag'],
-            mode='lines',
-            name='Trend',
-            line=dict(color='blue', width=1, dash='dash'),
-            hoverinfo='skip'
-        ))
-        
-        fig_nyquist.update_layout(
-            title="Nyquist Plot",
-            xaxis_title="Z' (Ω)",
-            yaxis_title="-Z'' (Ω)",
-            template="plotly_white",
-            height=500,
-            hovermode='closest',
-            showlegend=True
-        )
-        
-        st.plotly_chart(fig_nyquist, use_container_width=True)
-    
-    # ===== Tab 2: Bode Plot =====
-    with tab2:
-        st.subheader("Bode Plot")
-        
-        zmag = np.sqrt(result['z_real']**2 + result['z_imag']**2)
-        phase = np.arctan2(-result['z_imag'], result['z_real']) * 180 / np.pi
-        
-        fig_bode = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=("Magnitude", "Phase"),
-            specs=[[{"secondary_y": False}, {"secondary_y": False}]]
-        )
-        
-        # Magnitude (log-log)
-        fig_bode.add_trace(
-            go.Scatter(
-                x=result['freq'],
-                y=zmag,
-                mode='lines+markers',
-                name='|Z|',
-                line=dict(color='green', width=2),
-                marker=dict(size=5),
-                hovertemplate='f=%{x:.2e} Hz<br>|Z|=%{y:.1f} Ω<extra></extra>'
-            ),
-            row=1, col=1
-        )
-        
-        # Phase
-        fig_bode.add_trace(
-            go.Scatter(
-                x=result['freq'],
-                y=phase,
-                mode='lines+markers',
-                name='Phase',
-                line=dict(color='red', width=2),
-                marker=dict(size=5),
-                hovertemplate='f=%{x:.2e} Hz<br>φ=%{y:.1f}°<extra></extra>'
-            ),
-            row=1, col=2
-        )
-        
-        # 로그 스케일
-        fig_bode.update_xaxes(type='log', row=1, col=1)
-        fig_bode.update_xaxes(type='log', row=1, col=2)
-        fig_bode.update_yaxes(type='log', row=1, col=1)
-        
-        # 레이아웃
-        fig_bode.update_xaxes(title_text="Frequency (Hz)", row=1, col=1)
-        fig_bode.update_xaxes(title_text="Frequency (Hz)", row=1, col=2)
-        fig_bode.update_yaxes(title_text="|Z| (Ω)", row=1, col=1)
-        fig_bode.update_yaxes(title_text="Phase (°)", row=1, col=2)
-        
-        fig_bode.update_layout(
-            template="plotly_white",
-            height=500,
-            showlegend=True,
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig_bode, use_container_width=True)
-    
-    # ===== Tab 3: DRT =====
-    with tab3:
-        st.subheader("Distribution of Relaxation Times (DRT)")
-        
-        fig_drt = go.Figure()
-        
-        fig_drt.add_trace(go.Scatter(
-            x=result['tau'],
-            y=result['gamma'],
-            mode='lines+markers',
-            name='γ(τ)',
-            line=dict(color='purple', width=2),
-            marker=dict(size=4),
-            fill='tozeroy',
-            fillcolor='rgba(128, 0, 128, 0.2)',
-            hovertemplate='τ=%{x:.2e} s<br>γ=%{y:.6f} A/Ω<extra></extra>'
-        ))
-        
-        # 피크 표시
-        for i, peak in enumerate(result['peaks_info']):
-            fig_drt.add_vline(
-                x=peak['tau_peak'],
-                line_dash='dash',
-                line_color='red',
-                annotation_text=f"Peak {i+1}",
-                annotation_position="top"
+        with col1:
+            fig_drt = go.Figure()
+            
+            fig_drt.add_trace(go.Scatter(
+                x=analyzer.tau_grid,
+                y=analyzer.gamma,
+                mode='lines',
+                name='γ(τ)',
+                line=dict(color='#1f77b4', width=3),
+                fill='tozeroy',
+                fillcolor='rgba(31, 119, 180, 0.3)'
+            ))
+            
+            # Mark peaks
+            if analyzer.peaks_info:
+                peak_taus = [p['tau'] for p in analyzer.peaks_info]
+                peak_gammas = [p['gamma'] for p in analyzer.peaks_info]
+                
+                fig_drt.add_trace(go.Scatter(
+                    x=peak_taus,
+                    y=peak_gammas,
+                    mode='markers',
+                    name='Peaks',
+                    marker=dict(color='red', size=10, symbol='star')
+                ))
+            
+            fig_drt.update_xaxes(type='log', title='Time Constant τ (s)')
+            fig_drt.update_yaxes(title='γ(τ) (Ω/log(s))')
+            fig_drt.update_layout(
+                title='Distribution of Relaxation Times (DRT)',
+                height=500,
+                hovermode='x unified',
+                template='plotly_white'
             )
+            
+            st.plotly_chart(fig_drt, use_container_width=True)
         
-        fig_drt.update_layout(
-            title="Distribution of Relaxation Times",
-            xaxis_title="τ (s)",
-            yaxis_title="γ(τ) (A/Ω)",
-            xaxis_type='log',
-            template="plotly_white",
-            height=500,
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig_drt, use_container_width=True)
+        with col2:
+            summary = analyzer.get_summary()
+            
+            st.markdown("### Summary")
+            st.metric("Peaks", summary['n_peaks'])
+            st.metric("λ (optimal)", f"{summary['lambda_opt']:.2e}")
+            st.metric("γ_max", f"{summary['gamma_max']:.2e} Ω")
+            st.metric("Total R", f"{summary['total_resistance']:.1f} Ω")
     
-    # ===== Tab 4: 재구성 검증 =====
-    with tab4:
-        st.subheader("원본 vs 재구성 Z'' 비교")
+    # TAB 2: NYQUIST & BODE
+    # ====================================================================
+    
+    with tab2:
+        col1, col2 = st.columns(2)
         
-        fig_recon = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=("Z'' 비교", "잔차 (Residual)"),
-            specs=[[{"secondary_y": False}, {"secondary_y": False}]]
-        )
-        
-        # Z'' 비교
-        fig_recon.add_trace(
-            go.Scatter(
-                x=result['freq'],
-                y=result['z_imag'],
+        with col1:
+            # Nyquist Plot
+            fig_nyquist = go.Figure()
+            
+            fig_nyquist.add_trace(go.Scatter(
+                x=z_real,
+                y=z_imag,
                 mode='markers',
-                name='Measured',
-                marker=dict(size=6, color='blue'),
-                hovertemplate='f=%{x:.2e} Hz<br>Z\'\'=%{y:.1f} Ω<extra></extra>'
-            ),
-            row=1, col=1
-        )
-        
-        fig_recon.add_trace(
-            go.Scatter(
-                x=result['freq'],
-                y=result['z_imag_recon'],
+                name='Experimental',
+                marker=dict(color='blue', size=8),
+                text=[f'{f:.0f} Hz' for f in freq],
+                hoverinfo='text'
+            ))
+            
+            fig_nyquist.add_trace(go.Scatter(
+                x=analyzer.Z_reconst_real,
+                y=analyzer.Z_reconst_imag,
                 mode='lines',
                 name='Reconstructed',
-                line=dict(color='red', dash='dash', width=2),
-                hovertemplate='f=%{x:.2e} Hz<br>Z\'\'=%{y:.1f} Ω<extra></extra>'
-            ),
-            row=1, col=1
-        )
+                line=dict(color='red', width=2, dash='dash')
+            ))
+            
+            fig_nyquist.update_xaxes(title="Z' (Ω)")
+            fig_nyquist.update_yaxes(title="-Z'' (Ω)")
+            fig_nyquist.update_layout(
+                title='Nyquist Plot',
+                height=500,
+                hovermode='closest',
+                template='plotly_white'
+            )
+            
+            st.plotly_chart(fig_nyquist, use_container_width=True)
         
-        # 잔차
-        fig_recon.add_trace(
-            go.Scatter(
-                x=result['freq'],
-                y=result['residual'],
-                mode='markers',
-                name='Residual',
-                marker=dict(size=6, color='green'),
-                hovertemplate='f=%{x:.2e} Hz<br>Residual=%{y:.2e}<extra></extra>'
-            ),
-            row=1, col=2
-        )
-        
-        # 로그 스케일
-        fig_recon.update_xaxes(type='log', row=1, col=1)
-        fig_recon.update_xaxes(type='log', row=1, col=2)
-        
-        # 레이아웃
-        fig_recon.update_xaxes(title_text="Frequency (Hz)", row=1, col=1)
-        fig_recon.update_xaxes(title_text="Frequency (Hz)", row=1, col=2)
-        fig_recon.update_yaxes(title_text="Z'' (Ω)", row=1, col=1)
-        fig_recon.update_yaxes(title_text="Residual", row=1, col=2)
-        
-        fig_recon.update_layout(
-            template="plotly_white",
-            height=500,
-            showlegend=True,
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig_recon, use_container_width=True)
-        
-        # 오차 통계
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("RMSE", f"{result['rmse']:.2e}")
         with col2:
-            st.metric("Rel. Error", f"{result['rel_error']*100:.2f}%")
-        with col3:
-            st.metric("Mean |Residual|", f"{np.mean(np.abs(result['residual'])):.2e}")
-    
-    # ===== Tab 5: 피크 테이블 =====
-    with tab5:
-        st.subheader("탐지된 피크")
-        
-        if result['peaks_df'] is not None and len(result['peaks_df']) > 0:
-            st.dataframe(result['peaks_df'], use_container_width=True)
+            # Bode Plot
+            mag = np.sqrt(z_real**2 + z_imag**2)
+            phase = np.arctan2(z_imag, z_real) * 180 / np.pi
             
-            # 피크별 해석
-            with st.expander("📝 피크 해석"):
-                for i, peak in enumerate(result['peaks_info']):
-                    st.write(f"**Peak {i+1}:**")
-                    st.write(f"  - τ = {peak['tau_peak']:.2e} s (log₁₀ = {np.log10(peak['tau_peak']):.2f})")
-                    st.write(f"  - γ = {peak['gamma_peak']:.6f} A/Ω")
-                    st.write(f"  - ΔR (저항기여) ≈ {peak['area']:.4f} Ω")
-                    st.write(f"  - τ 범위: {peak['tau_left']:.2e} ~ {peak['tau_right']:.2e} s")
+            mag_reconst = np.sqrt(analyzer.Z_reconst_real**2 + analyzer.Z_reconst_imag**2)
+            phase_reconst = np.arctan2(analyzer.Z_reconst_imag, analyzer.Z_reconst_real) * 180 / np.pi
+            
+            fig_bode = go.Figure()
+            
+            fig_bode.add_trace(go.Scatter(
+                x=freq, y=mag,
+                mode='markers',
+                name='|Z| (exp)',
+                marker=dict(color='blue', size=6),
+                yaxis='y1'
+            ))
+            
+            fig_bode.add_trace(go.Scatter(
+                x=freq, y=mag_reconst,
+                mode='lines',
+                name='|Z| (fit)',
+                line=dict(color='red', dash='dash'),
+                yaxis='y1'
+            ))
+            
+            fig_bode.add_trace(go.Scatter(
+                x=freq, y=phase,
+                mode='markers',
+                name='Phase (exp)',
+                marker=dict(color='green', size=6),
+                yaxis='y2'
+            ))
+            
+            fig_bode.add_trace(go.Scatter(
+                x=freq, y=phase_reconst,
+                mode='lines',
+                name='Phase (fit)',
+                line=dict(color='orange', dash='dash'),
+                yaxis='y2'
+            ))
+            
+            fig_bode.update_xaxes(type='log', title='Frequency (Hz)')
+            fig_bode.update_yaxes(title='|Z| (Ω)', secondary_y=False)
+            fig_bode.update_layout(
+                yaxis2=dict(title='Phase (°)', overlaying='y', side='right'),
+                title='Bode Plot',
+                height=500,
+                hovermode='x unified',
+                template='plotly_white'
+            )
+            
+            st.plotly_chart(fig_bode, use_container_width=True)
+    
+    # TAB 3: FIT QUALITY
+    # ====================================================================
+    
+    with tab3:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### Fit Statistics")
+            metrics = analyzer.get_summary()['fit_metrics']
+            metrics_residual = analyzer.get_summary()['residual_stats']
+            
+            st.metric("Data Points", metrics['n_points'])
+            st.metric("RMSE", f"{metrics_residual['rmse']:.2e} Ω")
+            st.metric("Relative Error", f"{metrics_residual['relative_error']:.4f}")
+            st.metric("Max Error", f"{metrics_residual['max_error']:.2e} Ω")
+        
+        with col2:
+            # Residual plot
+            n_freq = len(freq)
+            residual_real = analyzer.residual['abs'][:n_freq]
+            residual_imag = analyzer.residual['abs'][n_freq:]
+            
+            fig_residual = go.Figure()
+            
+            fig_residual.add_trace(go.Scatter(
+                x=freq, y=residual_real,
+                mode='markers',
+                name="Residual Z'",
+                marker=dict(color='blue')
+            ))
+            
+            fig_residual.add_trace(go.Scatter(
+                x=freq, y=residual_imag,
+                mode='markers',
+                name='Residual Z"',
+                marker=dict(color='red')
+            ))
+            
+            fig_residual.update_xaxes(type='log', title='Frequency (Hz)')
+            fig_residual.update_yaxes(title='Residual (Ω)')
+            fig_residual.update_layout(
+                title='Fit Residuals',
+                height=400,
+                template='plotly_white'
+            )
+            
+            st.plotly_chart(fig_residual, use_container_width=True)
+    
+    # TAB 4: PEAKS ANALYSIS
+    # ====================================================================
+    
+    with tab4:
+        if analyzer.peaks_info:
+            st.markdown("### Detected Peaks in DRT")
+            
+            peaks_df = pd.DataFrame([
+                {
+                    'Peak #': i+1,
+                    'τ (s)': f"{p['tau']:.2e}",
+                    'γ (Ω)': f"{p['gamma']:.2e}",
+                    'Resistance (Ω)': f"{p['resistance']:.2f}",
+                    'f @ τ (Hz)': f"{1/(2*np.pi*p['tau']):.2e}"
+                }
+                for i, p in enumerate(analyzer.peaks_info)
+            ])
+            
+            st.dataframe(peaks_df, use_container_width=True)
+            
+            # Peak decomposition chart
+            fig_peaks = go.Figure()
+            
+            fig_peaks.add_trace(go.Scatter(
+                x=analyzer.tau_grid,
+                y=analyzer.gamma,
+                mode='lines',
+                name='Total DRT',
+                line=dict(color='black', width=2)
+            ))
+            
+            colors = px.colors.qualitative.Plotly
+            for i, peak in enumerate(analyzer.peaks_info):
+                tau_range = np.logspace(
+                    np.log10(peak['fwhm_range'][0]),
+                    np.log10(peak['fwhm_range'][1]),
+                    50
+                )
+                idx_range = [np.argmin(np.abs(analyzer.tau_grid - t)) for t in tau_range]
+                
+                fig_peaks.add_trace(go.Scatter(
+                    x=tau_range,
+                    y=analyzer.gamma[idx_range],
+                    mode='lines',
+                    name=f"Peak {i+1} (τ={peak['tau']:.2e}s)",
+                    line=dict(color=colors[i % len(colors)]),
+                    fill='tozeroy'
+                ))
+            
+            fig_peaks.update_xaxes(type='log', title='Time Constant τ (s)')
+            fig_peaks.update_yaxes(title='γ(τ) (Ω/log(s))')
+            fig_peaks.update_layout(
+                title='Peak Decomposition',
+                height=500,
+                template='plotly_white'
+            )
+            
+            st.plotly_chart(fig_peaks, use_container_width=True)
+        
         else:
-            st.info("🔍 탐지된 피크가 없습니다. 규제화 파라미터를 조정해보세요.")
+            st.info("No significant peaks detected")
     
-    # ===== 다운로드 섹션 =====
-    st.divider()
-    st.subheader("📥 결과 다운로드")
+    # TAB 5: EXPORT
+    # ====================================================================
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Excel 다운로드
-        output = BytesIO()
+    with tab5:
+        st.markdown("### Export Results")
         
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # Sheet 1: 요약
-            summary_df = pd.DataFrame({
-                'Parameter': [
-                    'τ_peak (s)',
-                    'γ_max (A/Ω)',
-                    'Total R (Ω)',
-                    'RMSE',
-                    'Rel. Error (%)',
-                    'λ',
-                    'Reg. Order',
-                    'Method',
-                    'n_tau'
-                ],
-                'Value': [
-                    result['stats']['tau_at_max'],
-                    result['stats']['gamma_max'],
-                    result['stats']['total_R'],
-                    result['rmse'],
-                    result['rel_error']*100,
-                    result['lambda_param'],
-                    result['reg_order'],
-                    result['method'],
-                    result['n_tau']
-                ]
-            })
-            summary_df.to_excel(writer, sheet_name='Summary', index=False)
-            
-            # Sheet 2: 피크
-            if result['peaks_df'] is not None and len(result['peaks_df']) > 0:
-                result['peaks_df'].to_excel(writer, sheet_name='Peaks', index=False)
-            
-            # Sheet 3: 원본 데이터
-            data_df = pd.DataFrame({
-                'Frequency (Hz)': result['freq'],
-                "Z' (Ω)": result['z_real'],
-                "Z'' (Ω)": result['z_imag'],
-                "Z'' Recon (Ω)": result['z_imag_recon'],
-                'Residual': result['residual']
-            })
-            data_df.to_excel(writer, sheet_name='Data', index=False)
-            
-            # Sheet 4: DRT
-            drt_df = pd.DataFrame({
-                'τ (s)': result['tau'],
-                'log₁₀(τ)': np.log10(result['tau']),
-                'γ(τ) (A/Ω)': result['gamma']
-            })
-            drt_df.to_excel(writer, sheet_name='DRT', index=False)
+        col1, col2, col3 = st.columns(3)
         
-        output.seek(0)
-        st.download_button(
-            label="📊 Excel 다운로드",
-            data=output.getvalue(),
-            file_name="drt_result.xlsx",
-            mime="application/vnd.ms-excel",
+        # Export Excel
+        with col1:
+            if st.button("📥 Download Excel", use_container_width=True):
+                excel_buffer = BytesIO()
+                
+                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                    # Sheet 1: Summary
+                    summary = analyzer.get_summary()
+                    summary_df = pd.DataFrame({
+                        'Parameter': ['Measurement Date', 'Num Data Points', 'Num Tau Points',
+                                    'Num Peaks', 'Optimal λ', 'RMSE', 'Relative Error', 'Max Error'],
+                        'Value': [
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            summary['fit_metrics']['n_points'],
+                            len(analyzer.tau_grid),
+                            summary['n_peaks'],
+                            f"{summary['lambda_opt']:.2e}",
+                            f"{summary['residual_stats']['rmse']:.2e}",
+                            f"{summary['residual_stats']['relative_error']:.4f}",
+                            f"{summary['residual_stats']['max_error']:.2e}"
+                        ]
+                    })
+                    summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                    
+                    # Sheet 2: DRT
+                    drt_df = pd.DataFrame({
+                        'tau (s)': analyzer.tau_grid,
+                        'gamma (Ω)': analyzer.gamma
+                    })
+                    drt_df.to_excel(writer, sheet_name='DRT', index=False)
+                    
+                    # Sheet 3: Raw EIS
+                    eis_df = pd.DataFrame({
+                        'Frequency (Hz)': freq,
+                        'Z_real (Ω)': z_real,
+                        'Z_imag (Ω)': z_imag,
+                        'Z_real_reconst (Ω)': analyzer.Z_reconst_real,
+                        'Z_imag_reconst (Ω)': analyzer.Z_reconst_imag
+                    })
+                    eis_df.to_excel(writer, sheet_name='EIS Data', index=False)
+                    
+                    # Sheet 4: Peaks
+                    if analyzer.peaks_info:
+                        peaks_export = pd.DataFrame([
+                            {
+                                'Peak #': i+1,
+                                'tau (s)': p['tau'],
+                                'gamma (Ω)': p['gamma'],
+                                'Resistance (Ω)': p['resistance'],
+                                'Frequency @ tau (Hz)': 1/(2*np.pi*p['tau'])
+                            }
+                            for i, p in enumerate(analyzer.peaks_info)
+                        ])
+                        peaks_export.to_excel(writer, sheet_name='Peaks', index=False)
+                
+                excel_buffer.seek(0)
+                st.download_button(
+                    label="✅ Download Excel",
+                    data=excel_buffer,
+                    file_name=f"DRT_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+        
+        # Export JSON
+        with col2:
+            if st.button("📥 Download JSON", use_container_width=True):
+                export_data = {
+                    'metadata': {
+                        'analysis_date': datetime.now().isoformat(),
+                        'n_data_points': len(freq),
+                        'n_tau_points': len(analyzer.tau_grid)
+                    },
+                    'parameters': {
+                        'lambda_opt': float(analyzer.lambda_opt),
+                        'n_peaks': len(analyzer.peaks_info) if analyzer.peaks_info else 0
+                    },
+                    'fit_quality': {
+                        'rmse': float(analyzer.residual['rmse']),
+                        'relative_error': float(analyzer.residual['relative_error']),
+                        'max_error': float(analyzer.residual['max_error'])
+                    },
+                    'drt': {
+                        'tau': analyzer.tau_grid.tolist(),
+                        'gamma': analyzer.gamma.tolist()
+                    },
+                    'peaks': [
+                        {
+                            'tau': float(p['tau']),
+                            'gamma': float(p['gamma']),
+                            'resistance': float(p['resistance'])
+                        }
+                        for p in (analyzer.peaks_info or [])
+                    ]
+                }
+                
+                json_str = json.dumps(export_data, indent=2)
+                st.download_button(
+                    label="✅ Download JSON",
+                    data=json_str,
+                    file_name=f"DRT_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
+        
+        with col3:
+            st.info("💾 Formats: Excel, JSON")
+        
+        # Data table
+        st.markdown("### DRT Data Table")
+        
+        drt_table = pd.DataFrame({
+            'τ (s)': analyzer.tau_grid,
+            'γ(τ) (Ω)': analyzer.gamma,
+            'log(τ)': np.log10(analyzer.tau_grid)
+        })
+        
+        st.dataframe(
+            drt_table.style.format({
+                'τ (s)': '{:.2e}',
+                'γ(τ) (Ω)': '{:.2e}',
+                'log(τ)': '{:.2f}'
+            }),
             use_container_width=True
         )
-    
-    with col2:
-        st.info("💾 CSV 형식은 추가 개발 예정")
 
-# ===== 도움말 =====
-else:
-    st.title("⚡ DRT 분석 도구")
-    st.write("""
-    ### 👋 사용 가이드
-    
-    1. **데이터 업로드**: 좌측 사이드바에서 EIS 파일(CSV/Excel)을 업로드하세요
-    2. **파라미터 설정**: τ 그리드, 규제화 강도(λ) 등을 조정합니다
-    3. **분석 실행**: "🚀 분석 시작" 버튼을 클릭합니다
-    4. **결과 확인**: Nyquist, Bode, DRT, 재구성 등 5개 탭에서 결과를 확인합니다
-    5. **결과 저장**: Excel 형식으로 다운로드합니다
-    
-    ### 📚 기본 개념
-    
-    **DRT (Distribution of Relaxation Times)**는 EIS 데이터를 주파수 영역에서 시간상수(τ) 영역으로 변환하는 분석 방법입니다.
-    
-    - **τ (시간상수)**: 각 프로세스의 특성 시간 스케일
-    - **γ(τ)**: 특정 τ에서의 저항 기여도
-    - **λ (규제화 강도)**: 작을수록 데이터 적합성 ↑, 클수록 노이즈 내성 ↑
-    
-    ### 🧪 테스트
-    
-    처음 사용하시면 좌측에서 "합성 데이터"를 선택해 테스트해보세요!
-    """)
-    
-    st.info("💡 사이드바에서 파일을 업로드하면 분석을 시작할 수 있습니다.")
+# ============================================================================
+# FOOTER
+# ============================================================================
 
-
-# ===== Footer =====
 st.divider()
-st.caption("""
-**DRT Analysis Tool v0.1**  
-Based on pyDRTtools (Ciucci's Lab, HKUST)  
-Reference: Wan et al. (2015), Liu & Ciucci (2019)  
-[GitHub](https://github.com/ciuccislab/pyDRTtools)
+
+st.markdown("""
+**DRT Analysis Tool v1.0**  
+⚡ Electrochemical Impedance Spectroscopy Analysis  
+📄 Built with Streamlit | Powered by Tikhonov Regularization  
+📚 Theory: Ciucci et al., Joule (2022) | ChemElectroChem (2019)  
+📖 Docs: [GitHub](https://github.com) | License: MIT
 """)

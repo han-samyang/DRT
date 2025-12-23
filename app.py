@@ -224,49 +224,73 @@ if clear_button:
     st.cache_data.clear()
     st.rerun()
 
-if run_button or 'drt_analyzer' not in st.session_state:
-    
-    # Run analysis
-    with st.spinner("⏳ Analyzing... (this may take a few seconds)"):
-        analyzer = DRTAnalyzer()
-        analyzer.load_data(freq, z_real, z_imag)
-        success = analyzer.solve_drt(
-            n_tau=n_tau,
-            lambda_val=lambda_val,
-            lambda_auto=lambda_auto,
-            non_negative=non_negative,
-            verbose=False
-        )
-    
-    if success:
-        st.session_state.drt_analyzer = analyzer
-        st.session_state.freq = freq
-        st.session_state.z_real = z_real
-        st.session_state.z_imag = z_imag
-        st.session_state.metadata = metadata
-        st.rerun()
+# ============================================================================
+# MULTI-FILE ANALYSIS
+# ============================================================================
 
-if 'drt_analyzer' in st.session_state:
-    analyzer = st.session_state.drt_analyzer
-    freq = st.session_state.freq
-    z_real = st.session_state.z_real
-    z_imag = st.session_state.z_imag
+if run_button or 'drt_analyzers' not in st.session_state:
     
-    st.success("✅ Analysis completed successfully!")
+    # Prepare datasets
+    if data_source == "Upload File" and 'datasets' in st.session_state and st.session_state.datasets:
+        datasets_to_analyze = st.session_state.datasets
+    elif freq is not None:
+        datasets_to_analyze = [{
+            'filename': metadata.get('sample_type', 'Data'),
+            'freq': freq,
+            'z_real': z_real,
+            'z_imag': z_imag
+        }]
+    else:
+        st.error("No data to analyze")
+        datasets_to_analyze = []
+    
+    if datasets_to_analyze:
+        analyzers = []
+        
+        with st.spinner(f"⏳ Analyzing {len(datasets_to_analyze)} dataset(s)... (this may take a few seconds)"):
+            for dataset in datasets_to_analyze:
+                analyzer = DRTAnalyzer()
+                analyzer.load_data(dataset['freq'], dataset['z_real'], dataset['z_imag'])
+                success = analyzer.solve_drt(
+                    n_tau=n_tau,
+                    lambda_val=lambda_val,
+                    lambda_auto=lambda_auto,
+                    non_negative=non_negative,
+                    verbose=False
+                )
+                
+                if success:
+                    analyzers.append({
+                        'filename': dataset['filename'],
+                        'analyzer': analyzer,
+                        'freq': dataset['freq'],
+                        'z_real': dataset['z_real'],
+                        'z_imag': dataset['z_imag']
+                    })
+        
+        if analyzers:
+            st.session_state.drt_analyzers = analyzers
+            st.session_state.datasets_analyzed = datasets_to_analyze
+            st.rerun()
+
+if 'drt_analyzers' in st.session_state:
+    analyzers_data = st.session_state.drt_analyzers
+    
+    st.success(f"✅ Analysis completed successfully! ({len(analyzers_data)} dataset(s))")
     
     # ========================================================================
     # RESULTS TABS
     # ========================================================================
     
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 DRT Plot", 
+        "📊 DRT Plot (Overlay)", 
         "🌀 Nyquist/Bode",
         "📈 Fit Quality",
         "🎯 Peaks",
         "💾 Export"
     ])
     
-    # TAB 1: DRT PLOT
+    # TAB 1: DRT PLOT - MULTI-FILE OVERLAY
     # ====================================================================
     
     with tab1:
@@ -287,47 +311,55 @@ if 'drt_analyzer' in st.session_state:
                 y_min = st.number_input("Y-min (Ω)", value=0, step=1000, help="Minimum γ'(ln τ)")
                 y_max = st.number_input("Y-max (Ω)", value=0, step=1000, help="Maximum γ'(ln τ) (0=auto)")
             
+            # Create overlay plot with all datasets
             fig_drt = go.Figure()
             
-            # Convert γ(τ) to differential form: γ'(ln τ) = γ(τ)/ln(10)
-            # This is the standard format in literature
-            gamma_differential = analyzer.gamma / np.log(10)
+            # Color palette for multiple files
+            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
             
-            fig_drt.add_trace(go.Scatter(
-                x=analyzer.tau_grid,
-                y=gamma_differential,
-                mode='lines',
-                name="γ'(ln τ)",
-                line=dict(color='#1f77b4', width=3),
-                fill='tozeroy',
-                fillcolor='rgba(31, 119, 180, 0.3)',
-                hovertemplate='τ=%{x:.2e}s<br>γ\'=%{y:.2e}Ω<extra></extra>'
-            ))
-            
-            # Mark peaks
-            if analyzer.peaks_info:
-                peak_taus = [p['tau'] for p in analyzer.peaks_info]
-                peak_gammas = [p['gamma'] / np.log(10) for p in analyzer.peaks_info]
+            # Add all DRT curves
+            for idx, analyzer_info in enumerate(analyzers_data):
+                analyzer = analyzer_info['analyzer']
+                filename = analyzer_info['filename']
+                color = colors[idx % len(colors)]
+                
+                # Convert γ(τ) to differential form: γ'(ln τ) = γ(τ)/ln(10)
+                gamma_differential = analyzer.gamma / np.log(10)
                 
                 fig_drt.add_trace(go.Scatter(
-                    x=peak_taus,
-                    y=peak_gammas,
-                    mode='markers+text',
-                    name='Peaks',
-                    marker=dict(color='red', size=10, symbol='star'),
-                    text=[f"Peak {i+1}" for i in range(len(peak_taus))],
-                    textposition='top center',
-                    hovertemplate='τ=%{x:.2e}s<br>γ\'=%{y:.2e}Ω<extra></extra>'
+                    x=analyzer.tau_grid,
+                    y=gamma_differential,
+                    mode='lines',
+                    name=f"{filename.replace('.csv', '').replace('.txt', '').replace('.xlsx', '')}",
+                    line=dict(color=color, width=2.5),
+                    fill='tozeroy' if idx == 0 else None,
+                    fillcolor='rgba(31, 119, 180, 0.2)' if idx == 0 else None,
+                    hovertemplate='<b>' + filename + '</b><br>τ=%{x:.2e}s<br>γ\'=%{y:.2e}Ω<extra></extra>'
                 ))
+                
+                # Mark peaks for this dataset
+                if analyzer.peaks_info:
+                    peak_taus = [p['tau'] for p in analyzer.peaks_info]
+                    peak_gammas = [p['gamma'] / np.log(10) for p in analyzer.peaks_info]
+                    
+                    fig_drt.add_trace(go.Scatter(
+                        x=peak_taus,
+                        y=peak_gammas,
+                        mode='markers',
+                        name=f"{filename.replace('.csv', '').replace('.txt', '').replace('.xlsx', '')} - Peaks",
+                        marker=dict(color=color, size=8, symbol='star', line=dict(color='black', width=1)),
+                        hovertemplate='<b>' + filename + '</b><br>τ=%{x:.2e}s<br>γ\'=%{y:.2e}Ω<extra></extra>',
+                        showlegend=True
+                    ))
             
             fig_drt.update_xaxes(
                 type='log',
                 title='Time Constant τ (s)',
                 titlefont=dict(size=12),
-                range=[x_min_exp, x_max_exp]  # Set X-axis range
+                range=[x_min_exp, x_max_exp]
             )
             
-            y_range = [y_min, y_max if y_max > 0 else None]  # Auto if 0
+            y_range = [y_min, y_max if y_max > 0 else None]
             fig_drt.update_yaxes(
                 title="γ'(ln τ) (Ω)",
                 titlefont=dict(size=12),
@@ -335,149 +367,139 @@ if 'drt_analyzer' in st.session_state:
             )
             
             fig_drt.update_layout(
-                title='Distribution of Relaxation Times (DRT)',
-                height=500,
+                title=f'Distribution of Relaxation Times - {len(analyzers_data)} Dataset(s) Overlay',
+                height=600,
                 hovermode='x unified',
                 template='plotly_white',
-                font=dict(size=11)
+                font=dict(size=11),
+                legend=dict(x=1.02, y=1, xanchor='left', yanchor='top')
             )
             
             st.plotly_chart(fig_drt, use_container_width=True)
         
         with col2:
-            summary = analyzer.get_summary()
+            st.markdown("### 📊 Summary")
+            st.metric("Datasets", len(analyzers_data))
             
-            st.markdown("### Summary")
-            st.metric("Peaks", summary['n_peaks'])
-            st.metric("λ (optimal)", f"{summary['lambda_opt']:.2e}")
-            st.metric("γ_max", f"{summary['gamma_max']:.2e} Ω")
-            st.metric("Total R", f"{summary['total_resistance']:.1f} Ω")
+            for idx, analyzer_info in enumerate(analyzers_data):
+                analyzer = analyzer_info['analyzer']
+                filename = analyzer_info['filename']
+                summary = analyzer.get_summary()
+                
+                st.markdown(f"**{idx+1}. {filename}**")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.metric("Peaks", summary['n_peaks'], label_visibility="collapsed")
+                with col_b:
+                    st.metric("λ opt", f"{summary['lambda_opt']:.0e}", label_visibility="collapsed")
+                col_c, col_d = st.columns(2)
+                with col_c:
+                    st.metric("γ_max", f"{summary['gamma_max']:.0e}Ω", label_visibility="collapsed")
+                with col_d:
+                    st.metric("Total R", f"{summary['total_resistance']:.0f}Ω", label_visibility="collapsed")
+                st.divider()
     
-    # TAB 2: NYQUIST & BODE
+    # TAB 2: NYQUIST & BODE - MULTI-FILE OVERLAY
     # ====================================================================
     
     with tab2:
-        # Multi-file overlay option
-        show_overlay = False
-        overlay_datasets = []
-        
-        if 'datasets' in st.session_state and len(st.session_state.datasets) > 1:
-            st.markdown("### 📊 Multiple File Comparison")
-            show_overlay = st.checkbox("Show all datasets overlay", value=False)
-            if show_overlay:
-                overlay_datasets = st.session_state.datasets
+        st.markdown(f"### 📊 EIS Comparison - {len(analyzers_data)} Dataset(s)")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            # Nyquist Plot
+            # Nyquist Plot - All datasets overlay
             fig_nyquist = go.Figure()
             
-            fig_nyquist.add_trace(go.Scatter(
-                x=z_real,
-                y=z_imag,
-                mode='markers',
-                name='Experimental EIS',
-                marker=dict(color='blue', size=6, opacity=0.7),
-                text=[f'{f:.0f} Hz' for f in freq],
-                hoverinfo='text+x+y',
-                hovertemplate='<b>%{text}</b><br>Z\'=%{x:.2f}Ω<br>-Z"=%{y:.2f}Ω<extra></extra>'
-            ))
+            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
             
-            fig_nyquist.add_trace(go.Scatter(
-                x=analyzer.Z_reconst_real,
-                y=analyzer.Z_reconst_imag,
-                mode='lines',
-                name='DRT Reconstructed',
-                line=dict(color='red', width=2.5),
-                hovertemplate='Z\'=%{x:.2f}Ω<br>-Z"=%{y:.2f}Ω<extra></extra>'
-            ))
+            for idx, analyzer_info in enumerate(analyzers_data):
+                analyzer = analyzer_info['analyzer']
+                freq_data = analyzer_info['freq']
+                z_real_data = analyzer_info['z_real']
+                z_imag_data = analyzer_info['z_imag']
+                filename = analyzer_info['filename']
+                color = colors[idx % len(colors)]
+                
+                # Experimental data
+                fig_nyquist.add_trace(go.Scatter(
+                    x=z_real_data,
+                    y=z_imag_data,
+                    mode='markers',
+                    name=f'{filename.replace(".csv", "").replace(".txt", "").replace(".xlsx", "")} (Exp)',
+                    marker=dict(color=color, size=6, opacity=0.7),
+                    text=[f'{f:.0f} Hz' for f in freq_data],
+                    hovertemplate='<b>' + filename + ' (Exp)</b><br>Z\'=%{x:.2f}Ω<br>-Z"=%{y:.2f}Ω<extra></extra>'
+                ))
+                
+                # DRT Reconstructed
+                fig_nyquist.add_trace(go.Scatter(
+                    x=analyzer.Z_reconst_real,
+                    y=analyzer.Z_reconst_imag,
+                    mode='lines',
+                    name=f'{filename.replace(".csv", "").replace(".txt", "").replace(".xlsx", "")} (DRT)',
+                    line=dict(color=color, width=2.5, dash='dash'),
+                    hovertemplate='<b>' + filename + ' (DRT)</b><br>Z\'=%{x:.2f}Ω<br>-Z"=%{y:.2f}Ω<extra></extra>'
+                ))
             
             fig_nyquist.update_xaxes(title="Z' (Ω)", titlefont=dict(size=12))
             fig_nyquist.update_yaxes(title="-Z'' (Ω)", titlefont=dict(size=12))
             fig_nyquist.update_layout(
-                title='Nyquist Plot: EIS vs DRT Reconstruction',
+                title='Nyquist Plot: All Datasets Overlay',
                 height=500,
                 hovermode='closest',
                 template='plotly_white',
                 font=dict(size=11),
-                legend=dict(x=0.02, y=0.98)
+                legend=dict(x=0.02, y=0.98, font=dict(size=9))
             )
             
             st.plotly_chart(fig_nyquist, use_container_width=True)
         
         with col2:
-            # Bode Plot - Improved version for compatibility
-            mag = np.sqrt(z_real**2 + z_imag**2)
-            phase = np.arctan2(z_imag, z_real) * 180 / np.pi
-            
-            mag_reconst = np.sqrt(analyzer.Z_reconst_real**2 + analyzer.Z_reconst_imag**2)
-            phase_reconst = np.arctan2(analyzer.Z_reconst_imag, analyzer.Z_reconst_real) * 180 / np.pi
-            
+            # Bode Plot - All datasets overlay
             fig_bode = go.Figure()
             
-            # Magnitude - experimental
-            fig_bode.add_trace(go.Scatter(
-                x=freq, y=mag,
-                mode='markers',
-                name='|Z| (Experimental)',
-                marker=dict(color='blue', size=6, opacity=0.7),
-                yaxis='y',
-                hovertemplate='f=%{x:.0f} Hz<br>|Z|=%{y:.2f}Ω<extra></extra>'
-            ))
+            for idx, analyzer_info in enumerate(analyzers_data):
+                analyzer = analyzer_info['analyzer']
+                freq_data = analyzer_info['freq']
+                z_real_data = analyzer_info['z_real']
+                z_imag_data = analyzer_info['z_imag']
+                filename = analyzer_info['filename']
+                color = colors[idx % len(colors)]
+                
+                # Magnitude
+                mag = np.sqrt(z_real_data**2 + z_imag_data**2)
+                mag_reconst = np.sqrt(analyzer.Z_reconst_real**2 + analyzer.Z_reconst_imag**2)
+                
+                # Experimental magnitude
+                fig_bode.add_trace(go.Scatter(
+                    x=freq_data, y=mag,
+                    mode='markers',
+                    name=f'{filename.replace(".csv", "").replace(".txt", "").replace(".xlsx", "")} |Z|',
+                    marker=dict(color=color, size=5, opacity=0.7),
+                    yaxis='y',
+                    hovertemplate='<b>' + filename + '</b><br>f=%{x:.0f} Hz<br>|Z|=%{y:.2f}Ω<extra></extra>'
+                ))
+                
+                # DRT reconstructed magnitude
+                fig_bode.add_trace(go.Scatter(
+                    x=freq_data, y=mag_reconst,
+                    mode='lines',
+                    name=f'{filename.replace(".csv", "").replace(".txt", "").replace(".xlsx", "")} |Z| (DRT)',
+                    line=dict(color=color, width=2, dash='dash'),
+                    yaxis='y',
+                    hovertemplate='<b>' + filename + ' (DRT)</b><br>f=%{x:.0f} Hz<br>|Z|=%{y:.2f}Ω<extra></extra>'
+                ))
             
-            # Magnitude - reconstructed
-            fig_bode.add_trace(go.Scatter(
-                x=freq, y=mag_reconst,
-                mode='lines',
-                name='|Z| (DRT Fit)',
-                line=dict(color='red', width=2.5),
-                yaxis='y',
-                hovertemplate='f=%{x:.0f} Hz<br>|Z|=%{y:.2f}Ω<extra></extra>'
-            ))
-            
-            # Phase - experimental
-            fig_bode.add_trace(go.Scatter(
-                x=freq, y=phase,
-                mode='markers',
-                name='Phase (Experimental)',
-                marker=dict(color='green', size=6, opacity=0.7),
-                yaxis='y2',
-                hovertemplate='f=%{x:.0f} Hz<br>Phase=%{y:.1f}°<extra></extra>'
-            ))
-            
-            # Phase - reconstructed
-            fig_bode.add_trace(go.Scatter(
-                x=freq, y=phase_reconst,
-                mode='lines',
-                name='Phase (DRT Fit)',
-                line=dict(color='orange', width=2.5),
-                yaxis='y2',
-                hovertemplate='f=%{x:.0f} Hz<br>Phase=%{y:.1f}°<extra></extra>'
-            ))
-            
+            fig_bode.update_xaxes(type='log', title='Frequency (Hz)', titlefont=dict(size=12))
+            fig_bode.update_yaxes(type='log', title='|Z| (Ω)', titlefont=dict(size=12))
             fig_bode.update_layout(
-                xaxis=dict(
-                    type='log',
-                    title='Frequency (Hz)',
-                    titlefont=dict(size=12)
-                ),
-                yaxis=dict(
-                    title='|Z| (Ω)',
-                    titlefont=dict(size=12)
-                ),
-                yaxis2=dict(
-                    title='Phase (°)',
-                    overlaying='y',
-                    side='right',
-                    titlefont=dict(size=12)
-                ),
-                title='Bode Plot: Impedance Magnitude and Phase',
+                title='Bode Plot: All Datasets Overlay',
                 height=500,
                 hovermode='x unified',
                 template='plotly_white',
                 font=dict(size=11),
-                legend=dict(x=0.02, y=0.98)
+                legend=dict(x=0.02, y=0.98, font=dict(size=9))
             )
             
             st.plotly_chart(fig_bode, use_container_width=True)

@@ -69,53 +69,69 @@ z_imag = None
 metadata = {}
 
 if data_source == "Upload File":
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload CSV, Excel, or TXT file",
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload CSV, Excel, or TXT files (multiple files for overlay comparison)",
         type=["csv", "xlsx", "xls", "txt"],
+        accept_multiple_files=True,  # Enable multiple file upload
         help="Format: frequency(Hz) | Z_real(Ω) | -Z_imag(Ω)"
     )
     
-    if uploaded_file:
-        try:
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
-            elif uploaded_file.name.endswith('.txt'):
-                df = pd.read_csv(uploaded_file, sep='\t', skiprows=0)
-            else:
-                df = pd.read_excel(uploaded_file)
-            
-            # Auto-detect column names
-            freq_col = None
-            z_real_col = None
-            z_imag_col = None
-            
-            col_names_lower = [c.lower().strip() for c in df.columns]
-            
-            for i, cn in enumerate(col_names_lower):
-                if any(x in cn for x in ['freq', 'f ', 'ω', 'hz']):
-                    freq_col = df.columns[i]
-                elif any(x in cn for x in ["z'", 'zreal', 'zr', "z'", 're(z)', 'real']):
-                    z_real_col = df.columns[i]
-                elif any(x in cn for x in ['z"', 'zimag', 'zi', "z''", 'im(z)', 'imag', '-im(z)']):
-                    z_imag_col = df.columns[i]
-            
-            # Fallback to first 3 columns if auto-detect fails
-            if freq_col is None or z_real_col is None or z_imag_col is None:
-                st.sidebar.warning("Could not auto-detect columns. Using first 3 columns.")
-                freq_col, z_real_col, z_imag_col = df.columns[0], df.columns[1], df.columns[2]
-            
-            freq = df[freq_col].values
-            z_real = df[z_real_col].values
-            z_imag = np.abs(df[z_imag_col].values)  # Ensure positive
-            
-            st.sidebar.success(f"✓ Loaded {len(freq)} points")
-            
-            # Metadata
-            if 'date' in df.columns or 'Date' in df.columns:
-                metadata['date'] = str(df['Date' if 'Date' in df.columns else 'date'].iloc[0])
-            
-        except Exception as e:
-            st.sidebar.error(f"Error loading file: {e}")
+    # Store all datasets
+    datasets = []
+    
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            try:
+                if uploaded_file.name.endswith('.csv'):
+                    df = pd.read_csv(uploaded_file)
+                elif uploaded_file.name.endswith('.txt'):
+                    df = pd.read_csv(uploaded_file, sep='\t', skiprows=0)
+                else:
+                    df = pd.read_excel(uploaded_file)
+                
+                # Auto-detect column names
+                freq_col = None
+                z_real_col = None
+                z_imag_col = None
+                
+                col_names_lower = [c.lower().strip() for c in df.columns]
+                
+                for i, cn in enumerate(col_names_lower):
+                    if any(x in cn for x in ['freq', 'f ', 'ω', 'hz']):
+                        freq_col = df.columns[i]
+                    elif any(x in cn for x in ["z'", 'zreal', 'zr', "z'", 're(z)', 'real']):
+                        z_real_col = df.columns[i]
+                    elif any(x in cn for x in ['z"', 'zimag', 'zi', "z''", 'im(z)', 'imag', '-im(z)']):
+                        z_imag_col = df.columns[i]
+                
+                # Fallback to first 3 columns if auto-detect fails
+                if freq_col is None or z_real_col is None or z_imag_col is None:
+                    freq_col, z_real_col, z_imag_col = df.columns[0], df.columns[1], df.columns[2]
+                
+                freq_data = df[freq_col].values
+                z_real_data = df[z_real_col].values
+                z_imag_data = np.abs(df[z_imag_col].values)  # Ensure positive
+                
+                datasets.append({
+                    'filename': uploaded_file.name,
+                    'freq': freq_data,
+                    'z_real': z_real_data,
+                    'z_imag': z_imag_data,
+                    'n_points': len(freq_data)
+                })
+                
+            except Exception as e:
+                st.sidebar.error(f"Error loading {uploaded_file.name}: {e}")
+        
+        if datasets:
+            st.sidebar.success(f"✓ Loaded {len(datasets)} file(s)")
+            # For backward compatibility, use first dataset as primary
+            freq = datasets[0]['freq']
+            z_real = datasets[0]['z_real']
+            z_imag = datasets[0]['z_imag']
+            metadata['num_datasets'] = len(datasets)
+            # Store all datasets in session state for overlay
+            st.session_state.datasets = datasets
 
 else:  # Sample Data
     sample_type = st.sidebar.selectbox(
@@ -146,10 +162,14 @@ else:  # Sample Data
 
 st.sidebar.markdown("## 🔧 DRT Parameters")
 
-n_tau = st.sidebar.slider(
+# τ grid points: Number input instead of slider
+n_tau = st.sidebar.number_input(
     "τ grid points",
-    30, 300, 100,
-    help="Number of time constant points"
+    min_value=30,
+    max_value=500,
+    value=100,
+    step=10,
+    help="Number of time constant grid points for DRT analysis"
 )
 
 lambda_auto = st.sidebar.checkbox(
@@ -253,6 +273,20 @@ if 'drt_analyzer' in st.session_state:
         col1, col2 = st.columns([3, 1])
         
         with col1:
+            # Axis range controls
+            st.markdown("### 🔍 Axis Range (for peak comparison)")
+            axis_col1, axis_col2 = st.columns(2)
+            
+            with axis_col1:
+                st.markdown("**X-Axis (τ range)**")
+                x_min_exp = st.number_input("X-min (10^x s)", value=-6, step=1, help="Minimum log10(τ)")
+                x_max_exp = st.number_input("X-max (10^x s)", value=0, step=1, help="Maximum log10(τ)")
+            
+            with axis_col2:
+                st.markdown("**Y-Axis (γ' range)**")
+                y_min = st.number_input("Y-min (Ω)", value=0, step=1000, help="Minimum γ'(ln τ)")
+                y_max = st.number_input("Y-max (Ω)", value=0, step=1000, help="Maximum γ'(ln τ) (0=auto)")
+            
             fig_drt = go.Figure()
             
             # Convert γ(τ) to differential form: γ'(ln τ) = γ(τ)/ln(10)
@@ -286,8 +320,20 @@ if 'drt_analyzer' in st.session_state:
                     hovertemplate='τ=%{x:.2e}s<br>γ\'=%{y:.2e}Ω<extra></extra>'
                 ))
             
-            fig_drt.update_xaxes(type='log', title='Time Constant τ (s)', titlefont=dict(size=12))
-            fig_drt.update_yaxes(title="γ'(ln τ) (Ω)", titlefont=dict(size=12))
+            fig_drt.update_xaxes(
+                type='log',
+                title='Time Constant τ (s)',
+                titlefont=dict(size=12),
+                range=[x_min_exp, x_max_exp]  # Set X-axis range
+            )
+            
+            y_range = [y_min, y_max if y_max > 0 else None]  # Auto if 0
+            fig_drt.update_yaxes(
+                title="γ'(ln τ) (Ω)",
+                titlefont=dict(size=12),
+                range=y_range
+            )
+            
             fig_drt.update_layout(
                 title='Distribution of Relaxation Times (DRT)',
                 height=500,
@@ -311,6 +357,16 @@ if 'drt_analyzer' in st.session_state:
     # ====================================================================
     
     with tab2:
+        # Multi-file overlay option
+        show_overlay = False
+        overlay_datasets = []
+        
+        if 'datasets' in st.session_state and len(st.session_state.datasets) > 1:
+            st.markdown("### 📊 Multiple File Comparison")
+            show_overlay = st.checkbox("Show all datasets overlay", value=False)
+            if show_overlay:
+                overlay_datasets = st.session_state.datasets
+        
         col1, col2 = st.columns(2)
         
         with col1:

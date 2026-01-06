@@ -1,373 +1,373 @@
 """
-DRT (Distribution of Relaxation Times) Analysis Core Module
-===========================================================
-Implements Tikhonov regularization-based DRT transformation
-from Electrochemical Impedance Spectroscopy (EIS) data.
+Created on Tue Dec 10 2019
 
-Theory References:
-- Ciucci, F., & Orazov, M. (2014). J. Electrochem. Soc., 160(10), F1422.
-- Malifarge, B., et al. (2019). ChemElectroChem, 6(24), 6027–6037.
-
-License: MIT
+@author: Jiapeng Liu, Francesco Ciucci (francesco.ciucci@ust.hk)
 """
 
+######################################################################################
+# This python file includes all necessary functions for GP-DRT model implemented in  #
+# the paper "Liu, J., & Ciucci, F. (2019). The Gaussian process distribution of      #
+# relaxation times: A machine learning tool for the analysis and prediction of       #
+# electrochemical impedance spectroscopy data. Electrochimica Acta, 135316."         #
+#                                                                                    #
+# If you find it is useful, please feel free to use it, modify it, and develop based #
+# on this code. Please cite the paper if you utlize this code for academic useage.   #
+######################################################################################
+
+# imports
+from math import exp
+from math import pi
+from math import log
+from scipy import integrate
 import numpy as np
-from scipy.linalg import solve
-from scipy.optimize import fminbound
-from scipy.signal import find_peaks
-import warnings
+from numpy import linalg as la
 
-warnings.filterwarnings('ignore')
+# is a matrix positive definite?
+# if input matrix is positive-definite (<=> Cholesky decomposable), then true is returned
+# otherwise return false
 
+def is_PD(A):
 
-class DRTAnalyzer:
-    """Core DRT analyzer using Tikhonov regularization."""
-    
-    def __init__(self):
-        self.frequency = None
-        self.Z_real = None
-        self.Z_imag = None
-        self.omega = None
-        self.tau_grid = None
-        self.gamma = None
-        self.Z_reconst_real = None
-        self.Z_reconst_imag = None
-        self.residual = None
-        self.peaks_info = None
-        self.lambda_opt = None
-        self.fit_metrics = {}
-        
-    def load_data(self, frequency, Z_real, Z_imag):
-        """Load and preprocess EIS data.
-        
-        Note: Z_imag will be converted to absolute value (positive imaginary impedance)
-              This handles both -Z_imag and Z_imag input formats.
-        """
-        frequency = np.asarray(frequency, dtype=float)
-        Z_real = np.asarray(Z_real, dtype=float)
-        Z_imag = np.asarray(Z_imag, dtype=float)
-        
-        # Convert to positive values for physical meaning
-        Z_imag_abs = np.abs(Z_imag)
-        
-        sort_idx = np.argsort(frequency)
-        self.frequency = frequency[sort_idx]
-        self.Z_real = Z_real[sort_idx]
-        self.Z_imag = Z_imag_abs[sort_idx]
-        
-        unique_f, unique_idx = np.unique(self.frequency, return_index=True)
-        self.frequency = unique_f
-        self.Z_real = self.Z_real[unique_idx]
-        self.Z_imag = self.Z_imag[unique_idx]
-        
-        self.omega = 2 * np.pi * self.frequency
-        self.fit_metrics['n_points'] = len(self.frequency)
-        
-    def _setup_tau_grid(self, n_tau=100):
-        """Setup logarithmic time constant grid."""
-        if self.frequency is None:
-            raise ValueError("Data not loaded. Call load_data() first.")
-        
-        tau_min = 1 / (2 * np.pi * self.frequency.max())
-        tau_max = 1 / (2 * np.pi * self.frequency.min())
-        
-        extension = 0.5
-        tau_min_ext = tau_min / (10 ** extension)
-        tau_max_ext = tau_max * (10 ** extension)
-        
-        self.tau_grid = np.logspace(
-            np.log10(tau_min_ext), 
-            np.log10(tau_max_ext), 
-            n_tau
-        )
-        
-    def _build_kernel_matrix(self):
-        """Build kernel matrix K(ω, τ) for DRT inversion."""
-        n_freq = len(self.omega)
-        n_tau = len(self.tau_grid)
-        
-        A = np.zeros((2 * n_freq, n_tau))
-        
-        for j, tau in enumerate(self.tau_grid):
-            w_tau = self.omega * tau
-            denom = 1.0 + w_tau**2
-            
-            A[:n_freq, j] = tau / denom
-            A[n_freq:, j] = self.omega * tau**2 / denom
-        
-        return A
-    
-    def _build_data_vector(self):
-        """Build combined data vector [Z_real; Z_imag]."""
-        return np.concatenate([self.Z_real, self.Z_imag])
-    
-    def _regularization_matrix(self, n_tau, order=2):
-        """Build Tikhonov regularization matrix."""
-        if order == 1:
-            L = np.diff(np.eye(n_tau), axis=0)
-        elif order == 2:
-            I = np.eye(n_tau)
-            L = np.diff(I, n=2, axis=0)
-        else:
-            raise ValueError("Only order 1 or 2 supported")
-        return L
-    
-    def _compute_gcv(self, A, z, L, lambda_val):
-        """Compute Generalized Cross-Validation score."""
-        try:
-            ATA = A.T @ A
-            LTL = L.T @ L
-            ATz = A.T @ z
-            
-            M = ATA + lambda_val * LTL
-            gamma = solve(M, ATz)
-            
-            r = z - A @ gamma
-            rss = np.sum(r**2)
-            
-            try:
-                M_inv = np.linalg.inv(M)
-                trace = np.trace(A @ M_inv @ A.T)
-            except:
-                trace = A.shape[0]
-            
-            dof = A.shape[0] - trace
-            
-            if dof <= 0:
-                return np.inf
-            
-            gcv = rss / (dof ** 2)
-            return gcv
-            
-        except:
-            return np.inf
-    
-    def solve_drt(self, n_tau=100, lambda_val=None, lambda_auto=True, 
-                  non_negative=True, verbose=True):
-        """Solve DRT using Tikhonov regularization.
-        
-        Parameters:
-            n_tau (int): Number of tau points
-            lambda_val (float): Regularization parameter (if None, auto-select)
-            lambda_auto (bool): Use GCV for auto lambda selection
-            non_negative (bool): Enforce γ(τ) ≥ 0 (default: True for physical meaning)
-            verbose (bool): Print progress info
-            
-        Returns:
-            success (bool): True if solution converged
-        """
-        if self.frequency is None:
-            raise ValueError("Load data first using load_data()")
-        
-        self._setup_tau_grid(n_tau)
-        if verbose:
-            print(f"✓ Tau grid setup: {n_tau} points from {self.tau_grid[0]:.2e} to {self.tau_grid[-1]:.2e} s")
-        
-        A = self._build_kernel_matrix()
-        z = self._build_data_vector()
-        L = self._regularization_matrix(n_tau, order=2)
-        
-        if lambda_auto and lambda_val is None:
-            if verbose:
-                print("→ Searching optimal λ via GCV...")
-            
-            lambda_range = np.logspace(-8, 2, 50)
-            gcv_scores = []
-            
-            for lam in lambda_range:
-                gcv = self._compute_gcv(A, z, L, lam)
-                gcv_scores.append(gcv)
-            
-            idx_opt = np.nanargmin(gcv_scores)
-            self.lambda_opt = lambda_range[idx_opt]
-            
-            if verbose:
-                print(f"✓ Optimal λ = {self.lambda_opt:.2e} (GCV = {gcv_scores[idx_opt]:.2e})")
-        else:
-            self.lambda_opt = lambda_val if lambda_val is not None else 1e-4
-            if verbose:
-                print(f"✓ Using λ = {self.lambda_opt:.2e}")
-        
-        ATA = A.T @ A
-        LTL = L.T @ L
-        ATz = A.T @ z
-        
-        M = ATA + self.lambda_opt * LTL
-        
-        try:
-            gamma_raw = solve(M, ATz)
-            
-            if non_negative:
-                gamma = np.maximum(gamma_raw, 0)
-            else:
-                gamma = gamma_raw
-            
-            self.gamma = gamma
-            
-            if verbose:
-                print(f"✓ DRT solved, γ range: [{gamma.min():.2e}, {gamma.max():.2e}] Ω")
-            
-        except Exception as e:
-            print(f"✗ Solve failed: {e}")
-            return False
-        
-        self._reconstruct_impedance(A)
-        self._calculate_residuals(z)
-        self._find_peaks()
-        
+    try:
+        np.linalg.cholesky(A)
         return True
+    except np.linalg.LinAlgError:
+        return False
+
+# Find the nearest positive-definite matrix
+def nearest_PD(A):
     
-    def _reconstruct_impedance(self, A):
-        """Reconstruct impedance from gamma and kernel matrix."""
-        n_freq = len(self.frequency)
-        z_reconst = A @ self.gamma
-        
-        self.Z_reconst_real = z_reconst[:n_freq]
-        self.Z_reconst_imag = z_reconst[n_freq:]
-    
-    def _calculate_residuals(self, z):
-        """Calculate fit quality metrics."""
-        z_reconst = np.concatenate([self.Z_reconst_real, self.Z_reconst_imag])
-        residual = z - z_reconst
-        
-        mse = np.mean(residual**2)
-        rmse = np.sqrt(mse)
-        max_err = np.max(np.abs(residual))
-        
-        z_norm = np.linalg.norm(z)
-        relative_error = rmse / z_norm if z_norm > 0 else np.inf
-        
-        self.residual = {
-            'abs': residual,
-            'mse': mse,
-            'rmse': rmse,
-            'max_error': max_err,
-            'relative_error': relative_error
-        }
-        
-        self.fit_metrics['rmse'] = rmse
-        self.fit_metrics['relative_error'] = relative_error
-    
-    def _find_peaks(self, height_threshold=0.01):
-        """Detect peaks in DRT distribution.
-        
-        Parameters:
-            height_threshold (float): Relative height threshold (0-1) 
-                                    Lower value = more sensitive peak detection
-        """
-        if self.gamma is None:
-            return
-        
-        # Filter out very small or negative values
-        gamma_filtered = np.maximum(self.gamma, 0)  # Set negatives to 0
-        
-        if np.max(gamma_filtered) == 0:
-            self.peaks_info = []
-            return
-        
-        # Find peaks with adaptive threshold
-        max_height = np.max(gamma_filtered)
-        min_height = height_threshold * max_height
-        
-        peaks, properties = find_peaks(
-            gamma_filtered, 
-            height=min_height,
-            distance=max(1, len(gamma_filtered) // 30),  # More sensitive distance
-            prominence=min_height / 2
-        )
-        
-        self.peaks_info = []
-        
-        for peak_idx in peaks:
-            tau_peak = self.tau_grid[peak_idx]
-            gamma_peak = gamma_filtered[peak_idx]
-            
-            if gamma_peak <= 0:  # Skip zero or negative peaks
-                continue
-            
-            # Estimate FWHM
-            half_height = gamma_peak / 2
-            fwhm_left = tau_peak
-            fwhm_right = tau_peak
-            
-            for i in range(peak_idx - 1, -1, -1):
-                if gamma_filtered[i] < half_height:
-                    fwhm_left = self.tau_grid[i]
-                    break
-            
-            for i in range(peak_idx + 1, len(gamma_filtered)):
-                if gamma_filtered[i] < half_height:
-                    fwhm_right = self.tau_grid[i]
-                    break
-            
-            # Approximate resistance contribution (area under peak in log-space)
-            dlog_tau = np.log(self.tau_grid[1] / self.tau_grid[0])
-            idx_left = max(0, peak_idx - 5)
-            idx_right = min(len(gamma_filtered), peak_idx + 6)
-            resistance_contrib = np.sum(gamma_filtered[idx_left:idx_right]) * dlog_tau
-            
-            self.peaks_info.append({
-                'tau': tau_peak,
-                'gamma': gamma_peak,
-                'resistance': resistance_contrib,
-                'index': peak_idx,
-                'fwhm_range': (fwhm_left, fwhm_right)
-            })
-    
-    def get_summary(self):
-        """Get summary statistics of DRT analysis."""
-        if self.gamma is None:
-            return None
-        
-        summary = {
-            'n_peaks': len(self.peaks_info) if self.peaks_info else 0,
-            'gamma_max': np.max(self.gamma),
-            'gamma_min': np.min(self.gamma),
-            'total_resistance': np.sum(self.gamma) * np.log(self.tau_grid[1] / self.tau_grid[0]),
-            'lambda_opt': self.lambda_opt,
-            'fit_metrics': self.fit_metrics,
-            'residual_stats': {
-                'rmse': self.residual['rmse'],
-                'relative_error': self.residual['relative_error'],
-                'max_error': self.residual['max_error']
-            } if self.residual else None
-        }
-        
-        return summary
+    # based on 
+    # N.J. Higham (1988) https://doi.org/10.1016/0024-3795(88)90223-6
+    # and 
+    # https://www.mathworks.com/matlabcentral/fileexchange/42885-nearestspd
+
+    B = (A + A.T)/2
+    _, Sigma_mat, V = la.svd(B)
+
+    H = np.dot(V.T, np.dot(np.diag(Sigma_mat), V))
+
+    A_nPD = (B + H) / 2
+    A_symm = (A_nPD + A_nPD.T) / 2
+
+    k = 1
+    I = np.eye(A_symm.shape[0])
+
+    while not is_PD(A_symm):
+        eps = np.spacing(la.norm(A_symm))
+
+        # MATLAB's 'chol' accepts matrices with eigenvalue = 0, numpy does not not. 
+        # So where the matlab implementation uses 'eps(mineig)', we use the above definition.
+
+        min_eig = min(0, np.min(np.real(np.linalg.eigvals(A_symm))))
+        A_symm += I * (-min_eig * k**2 + eps)
+        k += 1
+
+    return A_symm
+
+# Define squared exponential kernel, $\sigma_f^2 \exp\left(-\frac{1}{2 \ell^2}\left(\xi-\xi^\prime\right)^2 \right)$
+def kernel(xi, xi_prime, sigma_f, ell):
+    return (sigma_f**2)*exp(-0.5/(ell**2)*((xi-xi_prime)**2))
 
 
-def generate_test_eis(circuit_type='RC', frequency=None, seed=42):
-    """Generate synthetic EIS data for testing."""
-    np.random.seed(seed)
+# the function to be integrated in eq (65) of the main text.
+# $\frac{\displaystyle e^{\Delta\xi_{mn}-\chi}}{1+\left(\displaystyle e^{\Delta\xi_{mn}-\chi}\right)^2} \frac{k(\chi)}{\sigma_f^2}$
+def integrand_L_im(x, delta_xi, sigma_f, ell):
+    kernel_part = 0.0
+    sqr_exp = exp(-0.5/(ell**2)*(x**2))
+    a = delta_xi-x
+    if a>0:
+        kernel_part = exp(-a)/(1.+exp(-2*a))
+    else:
+        kernel_part = exp(a)/(1.+exp(2*a))
+    return kernel_part*sqr_exp
+
+
+# the function to be integrated in eq (76) of the main text.
+# $\frac{1}{2} \left(\chi+\Delta\xi_{mn}\right){\rm csch}\left(\chi+\Delta\xi_{mn}\right) \frac{k(\chi)}{\sigma_f^2}$
+def integrand_L2_im(x, xi, xi_prime, sigma_f, ell):
+    delta_xi = xi_prime-xi
     
-    if frequency is None:
-        frequency = np.logspace(2, 6, 50)
-    
-    omega = 2 * np.pi * frequency
-    
-    if circuit_type == 'RC':
-        R0, R1, C1 = 10, 100, 1e-6
-        Z_real = R0 + R1 / (1 + (omega * R1 * C1)**2)
-        Z_imag = (omega * R1**2 * C1) / (1 + (omega * R1 * C1)**2)
+    y = x + delta_xi
+    eps = 1E-8
+    if y<-eps:
+        factor_1 = exp(-0.5/(ell**2)*(x**2))
+        factor_2 = y*exp(y)/(exp(2*y)-1.)
+    elif y>eps:
+        factor_1 = exp(-0.5/(ell**2)*(x**2))
+        factor_2 = y*exp(-y)/(1.-exp(-2*y))
+    else:
+        factor_1 = exp(-0.5/(ell**2)*(x**2))
+        factor_2 = 0.5
         
-    elif circuit_type == 'RC-RC':
-        R0, R1, C1, R2, C2 = 10, 50, 1e-6, 50, 1e-5
-        Z1_real = R1 / (1 + (omega * R1 * C1)**2)
-        Z1_imag = (omega * R1**2 * C1) / (1 + (omega * R1 * C1)**2)
-        Z2_real = R2 / (1 + (omega * R2 * C2)**2)
-        Z2_imag = (omega * R2**2 * C2) / (1 + (omega * R2 * C2)**2)
-        Z_real = R0 + Z1_real + Z2_real
-        Z_imag = Z1_imag + Z2_imag
+    out_val = factor_1*factor_2
+    return out_val
+
+
+# the derivative of the integrand in eq (76) with respect to \ell 
+# $\frac{1}{2} \left(\chi+\Delta\xi_{mn}\right){\rm csch}\left(\chi+\Delta\xi_{mn}\right) \frac{k(\chi)}{\sigma_f^2}\chi^2$
+# omitting the $\ell^3$ in the denominator
+def integrand_der_ell_L2_im(x, xi, xi_prime, sigma_f, ell):
+    f = exp(xi)
+    f_prime = exp(xi_prime)
+    if x<0:
+        numerator = (x**2)*exp(x-0.5/(ell**2)*(x**2))*(x+xi_prime-xi)
+        denominator = (-1+((f_prime/f)**2)*exp(2*x))
+    else:
+        numerator = (x**2)*exp(-x-0.5/(ell**2)*(x**2))*(x+xi_prime-xi)
+        denominator = (-exp(-2*x)+((f_prime/f)**2))
+    return numerator/denominator
+
+# assemble the covariance matrix K as shown in eq (18a), which calculates the kernel distance between $\xi_n$ and $\xi_m$
+def matrix_K(xi_n_vec, xi_m_vec, sigma_f, ell):
+    N_n_freqs = xi_n_vec.size
+    N_m_freqs = xi_m_vec.size
+    K = np.zeros([N_n_freqs, N_m_freqs])
+
+    for n in range(0, N_n_freqs):
+        for m in range(0, N_m_freqs):
+            K[n,m] = kernel(xi_n_vec[n], xi_m_vec[m], sigma_f, ell)
+    return K
+
+
+# assemble the matrix of eq (18b), added the term of $\frac{1}{\sigma_f^2}$ and factor $2\pi$ before $e^{\Delta\xi_{mn}-\chi}$
+def matrix_L_im_K(xi_n_vec, xi_m_vec, sigma_f, ell):
+
+    if np.array_equal(xi_n_vec, xi_m_vec):
+        # considering the case that $\xi_n$ and $\xi_m$ are identical, i.e., the matrix is square symmetrix
+        xi_vec = xi_n_vec
+        N_freqs = xi_vec.size
+        L_im_K = np.zeros([N_freqs, N_freqs])
+
+        delta_xi = log(2*pi)
+        integral, tol = integrate.quad(integrand_L_im, -np.inf, np.inf, epsabs=1E-12, epsrel=1E-12, args=(delta_xi, sigma_f, ell))
+        np.fill_diagonal(L_im_K, -(sigma_f**2)*(integral))
+
+        for n in range(1, N_freqs):
+            delta_xi = xi_vec[n]-xi_vec[0] + log(2*pi)
+            integral, tol = integrate.quad(integrand_L_im, -np.inf, np.inf, epsabs=1E-12, epsrel=1E-12, args=(delta_xi, sigma_f, ell))
+            np.fill_diagonal(L_im_K[:, n:], -(sigma_f**2)*(integral))
+            
+            delta_xi = xi_vec[0]-xi_vec[n] + log(2*pi)
+            integral, tol = integrate.quad(integrand_L_im, -np.inf, np.inf, epsabs=1E-12, epsrel=1E-12, args=(delta_xi, sigma_f, ell))
+            np.fill_diagonal(L_im_K[n:, :], -(sigma_f**2)*(integral))
+    else:
+        N_n_freqs = xi_n_vec.size
+        N_m_freqs = xi_m_vec.size
+        L_im_K = np.zeros([N_n_freqs, N_m_freqs])
+
+        for n in range(0, N_n_freqs):
+            for m in range(0, N_m_freqs):
+
+                delta_xi = xi_m_vec[m] - xi_n_vec[n] + log(2*pi)
+                integral, tol = integrate.quad(integrand_L_im, -np.inf, np.inf, epsabs=1E-12, epsrel=1E-12, args=(delta_xi, sigma_f, ell))
+                L_im_K[n,m] = -(sigma_f**2)*(integral)
+
+    return L_im_K
+
+
+# assemble the matrix of eq (18d), added the term of $\frac{1}{\sigma_f^2}$ and factor $2\pi$ before $e^{\Delta\xi_{mn}-\chi}$
+def matrix_L2_im_K(xi_n_vec, xi_m_vec, sigma_f, ell):
+
+    if np.array_equal(xi_n_vec, xi_m_vec):
+        # considering the case that $\xi_n$ and $\xi_m$ are identical, i.e., the matrix is square symmetric
+        xi_vec = xi_n_vec
+        N_freqs = xi_vec.size
+        L2_im_K = np.zeros([N_freqs, N_freqs])
         
-    else:  # Randles
-        R0, Rct, C_dl = 5, 100, 1e-5
-        sigma_w = 50
-        Z_w = sigma_w / np.sqrt(omega + 1e-10) * (1 - 1j)
-        Z_real = R0 + Rct / (1 + (omega * Rct * C_dl)**2) + Z_w.real
-        Z_imag = (omega * Rct**2 * C_dl) / (1 + (omega * Rct * C_dl)**2) + Z_w.imag
+        for n in range(0, N_freqs):
+            xi = xi_vec[n]
+            xi_prime = xi_vec[0]
+            integral, tol = integrate.quad(integrand_L2_im, -np.inf, np.inf, epsabs=1E-12, epsrel=1E-12, args=(xi, xi_prime, sigma_f, ell))
+            if n == 0:
+                np.fill_diagonal(L2_im_K, (sigma_f**2)*integral)
+            else:
+                np.fill_diagonal(L2_im_K[n:, :], (sigma_f**2)*integral)
+                np.fill_diagonal(L2_im_K[:, n:], (sigma_f**2)*integral)
+    else:
+        N_n_freqs = xi_n_vec.size
+        N_m_freqs = xi_m_vec.size
+        L2_im_K = np.zeros([N_n_freqs, N_m_freqs])
+
+        for n in range(0, N_n_freqs):
+            xi = xi_n_vec[n]
+            for m in range(0, N_m_freqs):
+                xi_prime = xi_m_vec[m]
+                integral, tol = integrate.quad(integrand_L2_im, -np.inf, np.inf, epsabs=1E-12, epsrel=1E-12, args=(xi, xi_prime, sigma_f, ell))
+                L2_im_K[n,m] = (sigma_f**2)*integral
+    return L2_im_K
+
+def compute_h_L(xi):
+
+    h_L = 2.*pi*np.exp(xi)
+    h_L = h_L.reshape(xi.size, 1)
+
+    return h_L
+
+
+# calculate the negative marginal log-likelihood (NMLL) of eq (31)
+def NMLL_fct(theta, Z_exp, xi_vec):
+    # load the initial value for parameters needed to optimize
+    sigma_n = theta[0]
+    sigma_f = theta[1]
+    ell = theta[2]
     
-    noise_level = 0.01
-    Z_real += np.random.normal(0, noise_level * np.mean(Z_real), len(Z_real))
-    Z_imag += np.random.normal(0, noise_level * np.mean(Z_imag), len(Z_imag))
+    N_freqs = xi_vec.size
+    Sigma = (sigma_n**2)*np.eye(N_freqs)                    # $\sigma_n^2 \mathbf I$
     
-    return frequency, Z_real, np.abs(Z_imag)
+    L2_im_K = matrix_L2_im_K(xi_vec, xi_vec, sigma_f, ell)  # $\mathcal L^2_{\rm im} \mathbf K$
+    K_im_full = L2_im_K + Sigma                             # $\mathbf K_{\rm im}^{\rm full} = \mathcal L^2_{\rm im} \mathbf K + \sigma_n^2 \mathbf I$
+
+    # begin FC - added 
+    if not is_PD(K_im_full):
+        K_im_full = nearest_PD(K_im_full)
+    # end FC - added 
+
+    L = np.linalg.cholesky(K_im_full)                       # Cholesky decomposition to get the inverse of $\mathbf K_{\rm im}^{\rm full}$
+    
+    # solve for alpha
+    alpha = np.linalg.solve(L, Z_exp.imag)
+    alpha = np.linalg.solve(L.T, alpha)                     # $(\mathcal L^2_{\rm im} \mathbf K + \sigma_n^2 \mathbf I)^{-1} \mathbf Z^{\rm exp}_{\rm im}$
+     
+    # return the final result of $L(\bm \theta)$, i.e., eq (32). Note that $\frac{N}{2} \log 2\pi$ 
+    # is not included as it is constant. The determinant of $\mathbf K_{\rm im}^{\rm full}$ is 
+    # easily calculated as the product of the diagonal element of L
+    return 0.5*np.dot(Z_exp.imag,alpha) + np.sum(np.log(np.diag(L)))
+
+def NMLL_fct_L(theta, Z_exp, xi_vec):
+    
+    sigma_n = theta[0] 
+    sigma_f = theta[1]  
+    ell = theta[2]
+    sigma_L = theta[3]
+    
+    N_freqs = xi_vec.size
+
+    L2_im_K = matrix_L2_im_K(xi_vec, xi_vec, sigma_f, ell)
+    Sigma = (sigma_n**2)*np.eye(N_freqs)
+    h_L = compute_h_L(xi_vec)
+    
+    K_im_full = L2_im_K + Sigma + (sigma_L**2)*np.outer(h_L, h_L)
+    K_im_full = 0.5*(K_im_full+K_im_full.T)
+
+    # begin FC - added 
+    if not is_PD(K_im_full):
+        K_im_full = nearest_PD(K_im_full)
+    # end FC - added 
+
+    L = np.linalg.cholesky(K_im_full)
+    
+    # solve for alpha
+    alpha = np.linalg.solve(L, Z_exp.imag)
+    alpha = np.linalg.solve(L.T, alpha)
+    return 0.5*np.dot(Z_exp.imag,alpha) + np.sum(np.log(np.diag(L)))
+
+# assemble the matrix corresponding to the derivative of eq (18d) with respect to $\ell$, similar to the above implementation 
+def der_ell_matrix_L2_im_K(xi_vec, sigma_f, ell):
+    N_freqs = xi_vec.size
+    der_ell_L2_im_K = np.zeros([N_freqs, N_freqs])
+
+    for n in range(0, N_freqs):
+        xi = xi_vec[n]
+        xi_prime = xi_vec[0]
+        integral, tol = integrate.quad(integrand_der_ell_L2_im, -np.inf, np.inf, epsabs=1E-12, epsrel=1E-12, args=(xi, xi_prime, sigma_f, ell))
+        np.fill_diagonal(der_ell_L2_im_K[n:, :], exp(xi_prime-xi)*(sigma_f**2)/(ell**3)*integral)
+        np.fill_diagonal(der_ell_L2_im_K[:, n:], exp(xi_prime-xi)*(sigma_f**2)/(ell**3)*integral)
+
+    return der_ell_L2_im_K
+
+# gradient of the negative marginal log-likelihhod (NMLL) $L(\bm \theta)$
+def grad_NMLL_fct(theta, Z_exp, xi_vec):
+    # load the initial value for parameters needed to optimize
+    sigma_n = theta[0] 
+    sigma_f = theta[1]  
+    ell     = theta[2]
+    
+    N_freqs = xi_vec.size
+    Sigma = (sigma_n**2)*np.eye(N_freqs)                    # $\sigma_n^2 \mathbf I$
+    
+    L2_im_K = matrix_L2_im_K(xi_vec, xi_vec, sigma_f, ell)  # $\mathcal L^2_{\rm im} \mathbf K$
+    K_im_full = L2_im_K + Sigma                             # $\mathbf K_{\rm im}^{\rm full} = \mathcal L^2_{\rm im} \mathbf K + \sigma_n^2 \mathbf I$
+    
+    # begin FC - added 
+    if not is_PD(K_im_full):
+        K_im_full = nearest_PD(K_im_full)
+    # end FC - added 
+    
+    L = np.linalg.cholesky(K_im_full)                       # Cholesky decomposition to get the inverse of $\mathbf K_{\rm im}^{\rm full}$
+
+    # solve for alpha
+    alpha = np.linalg.solve(L, Z_exp.imag)
+    alpha = np.linalg.solve(L.T, alpha)
+    
+    # compute inverse of K_im_full
+    inv_L = np.linalg.inv(L)
+    inv_K_im_full = np.dot(inv_L.T, inv_L)
+    
+    # calculate the derivative of matrices with respect to parameters including $sigma_n$, $sigma_f$, and $\ell$
+    der_mat_sigma_n = (2.*sigma_n)*np.eye(N_freqs)              # derivative of $\sigma_n^2 \mathbf I$ to $sigma_n$
+    der_mat_sigma_f = (2./sigma_f)*L2_im_K                      # note that the derivative is 2*sigma_f*L2_im_K/(sigma_f**2)
+    der_mat_ell = der_ell_matrix_L2_im_K(xi_vec, sigma_f, ell)  # derivative w.r.t $\ell$
+    
+    # calculate the derivative of $L(\bm \theta)$ w.r.t $sigma_n$, $sigma_f$, and $\ell$ according to eq (78)
+    d_K_im_full_d_sigma_n = - 0.5*np.dot(alpha.T, np.dot(der_mat_sigma_n, alpha)) \
+        + 0.5*np.trace(np.dot(inv_K_im_full, der_mat_sigma_n))    
+        
+    d_K_im_full_d_sigma_f = - 0.5*np.dot(alpha.T, np.dot(der_mat_sigma_f, alpha)) \
+        + 0.5*np.trace(np.dot(inv_K_im_full, der_mat_sigma_f))
+        
+    d_K_im_full_d_ell     = - 0.5*np.dot(alpha.T, np.dot(der_mat_ell, alpha)) \
+        + 0.5*np.trace(np.dot(inv_K_im_full, der_mat_ell))
+
+    grad = np.array([d_K_im_full_d_sigma_n, d_K_im_full_d_sigma_f, d_K_im_full_d_ell])
+    return grad
+
+def grad_NMLL_fct_L(theta, Z_exp, xi_vec):
+    
+    sigma_n = theta[0] 
+    sigma_f = theta[1]  
+    ell     = theta[2]
+    sigma_L = theta[3]
+    
+    N_freqs = xi_vec.size
+    L2_im_K = matrix_L2_im_K(xi_vec, xi_vec, sigma_f, ell)
+    Sigma = (sigma_n**2)*np.eye(N_freqs)
+    h_L = compute_h_L(xi_vec)
+    
+    K_im_full = L2_im_K + Sigma + (sigma_L**2)*np.outer(h_L, h_L)
+    
+    # begin FC - added 
+    if not is_PD(K_im_full):
+        K_im_full = nearest_PD(K_im_full)
+    # end FC - added 
+    L = np.linalg.cholesky(K_im_full)
+
+    # solve for alpha
+    alpha = np.linalg.solve(L, Z_exp.imag)
+    alpha = np.linalg.solve(L.T, alpha)
+    
+    # compute inverse of K_im_full
+    inv_L = np.linalg.inv(L)
+    inv_K_im_full = np.dot(inv_L.T, inv_L)
+    
+    # derivative matrices
+    der_mat_sigma_n = (2.*sigma_n)*np.eye(N_freqs)
+    der_mat_sigma_f = (2./sigma_f)*L2_im_K
+    der_mat_ell = der_ell_matrix_L2_im_K(xi_vec, sigma_f, ell)
+    der_mat_sigma_L = (2.*sigma_L)*np.outer(h_L, h_L)
+    
+    d_K_im_full_d_sigma_n = - 0.5*np.dot(alpha.T, np.dot(der_mat_sigma_n, alpha)) \
+        + 0.5*np.trace(np.dot(inv_K_im_full, der_mat_sigma_n))    
+        
+    d_K_im_full_d_sigma_f = - 0.5*np.dot(alpha.T, np.dot(der_mat_sigma_f, alpha)) \
+        + 0.5*np.trace(np.dot(inv_K_im_full, der_mat_sigma_f))
+        
+    d_K_im_full_d_ell     = - 0.5*np.dot(alpha.T, np.dot(der_mat_ell, alpha)) \
+        + 0.5*np.trace(np.dot(inv_K_im_full, der_mat_ell))
+        
+    d_K_im_full_d_sigma_L = - 0.5*np.dot(alpha.T, np.dot(der_mat_sigma_L, alpha)) \
+        + 0.5*np.trace(np.dot(inv_K_im_full, der_mat_sigma_L))   
+
+    grad = np.array([d_K_im_full_d_sigma_n, d_K_im_full_d_sigma_f, d_K_im_full_d_ell, d_K_im_full_d_sigma_L])
+
+    return grad
